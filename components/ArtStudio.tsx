@@ -91,13 +91,13 @@ const ArtStudio: React.FC = () => {
 
             {/* Quick Inspiration Pills */}
             <div className="space-y-1 pt-1">
-              <span className="text-[11px] text-slate-400 block">اقتراحات ملهمة للوحات:</span>
+              <span className="text-xs text-slate-400 block">اقتراحات ملهمة للوحات:</span>
               <div className="flex flex-col gap-1.5">
                 {PRESETS.slice(0, 2).map((item, idx) => (
                   <button
                     key={idx}
                     onClick={() => setPrompt(item)}
-                    className="text-right text-xs text-slate-300 hover:text-amber-300 bg-slate-800/60 hover:bg-slate-800 px-3 py-1.5 rounded-xl border border-slate-700/50 truncate transition-colors"
+                    className="text-start text-xs text-slate-300 hover:text-amber-300 bg-slate-800/60 hover:bg-slate-800 px-3 py-1.5 rounded-xl border border-slate-700/50 truncate transition-colors cursor-pointer"
                   >
                     ✦ {item}
                   </button>
@@ -117,14 +117,14 @@ const ArtStudio: React.FC = () => {
                 <button
                   key={script.id}
                   onClick={() => setScriptType(script.id)}
-                  className={`p-2.5 rounded-xl border text-right transition-all text-xs ${
+                  className={`p-2.5 rounded-xl border text-start transition-all text-xs cursor-pointer ${
                     scriptType === script.id 
                       ? 'bg-amber-500/20 border-amber-400 text-amber-300 font-bold shadow-sm' 
                       : 'bg-slate-900/40 border-slate-800 text-slate-400 hover:bg-white/5'
                   }`}
                 >
                   <div className="font-semibold">{script.label}</div>
-                  <div className="text-[10px] text-slate-500 truncate mt-0.5">{script.desc}</div>
+                  <div className="text-xs text-slate-500 truncate mt-0.5">{script.desc}</div>
                 </button>
               ))}
             </div>
@@ -141,13 +141,13 @@ const ArtStudio: React.FC = () => {
                 <button
                   key={atm.id}
                   onClick={() => setAtmosphere(atm.id)}
-                  className={`p-2 rounded-xl border text-center transition-all text-xs ${
+                  className={`p-2 rounded-xl border text-center transition-all text-xs cursor-pointer ${
                     atmosphere === atm.id 
                       ? 'bg-emerald-500/20 border-emerald-400 text-emerald-200 font-bold' 
                       : 'bg-slate-900/40 border-slate-800 text-slate-400 hover:bg-white/5'
                   }`}
                 >
-                  <div className="font-medium text-[11px] truncate">{atm.label.split(' ')[0]}</div>
+                  <div className="font-medium text-xs truncate">{atm.label.split(' ')[0]}</div>
                 </button>
               ))}
             </div>

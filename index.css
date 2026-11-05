@@ -1,8 +1,22 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: 'Almarai', sans-serif;
+  --font-calligraphy: 'Aref Ruqaa', serif;
+  --font-poetry: 'Scheherazade New', serif;
+}
+
+:root {
+  color-scheme: dark;
+}
+
 body {
-  font-family: 'Almarai', sans-serif;
+  font-family: var(--font-sans);
   background-color: #020617;
   color: #f8fafc;
   overflow-x: hidden;
+  font-size: 14px;
+  line-height: 1.6;
 }
 
 /* Custom Scrollbar for Arabic Glass UI */
@@ -12,14 +26,41 @@ body {
 }
 
 ::-webkit-scrollbar-track {
-  background: rgba(15, 23, 42, 0.6); 
+  background: rgba(15, 23, 42, 0.6);
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(217, 119, 6, 0.4); 
+  background: rgba(217, 119, 6, 0.4);
   border-radius: 9999px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(217, 119, 6, 0.7); 
+  background: rgba(217, 119, 6, 0.7);
+}
+
+/* Accessible animations: respect prefers-reduced-motion */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Performance optimization on mobile / small screens: reduce heavy multi-layer blur filters */
+@media (max-width: 768px) {
+  .backdrop-blur-3xl,
+  .backdrop-blur-2xl,
+  .backdrop-blur-xl,
+  .backdrop-blur-lg {
+    backdrop-filter: blur(8px) !important;
+    -webkit-backdrop-filter: blur(8px) !important;
+  }
+
+  .blur-\[120px\] {
+    filter: blur(40px) !important;
+  }
 }

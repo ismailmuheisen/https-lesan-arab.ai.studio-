@@ -56,7 +56,7 @@ const CACHE_404_DURATION_MS = 10 * 60 * 1000;
 export function recordModel404(modelName: string): void {
   const expiresAt = Date.now() + CACHE_404_DURATION_MS;
   model404Cache.set(modelName, expiresAt);
-  console.warn(`[models] Model '${modelName}' recorded 404. Skipping for 10 minutes (until ${new Date(expiresAt).toISOString()}).`);
+  console.log(`[models] Model '${modelName}' recorded 404. Skipping for 10 minutes.`);
 }
 
 export function isModel404Cached(modelName: string): boolean {
@@ -69,22 +69,159 @@ export function isModel404Cached(modelName: string): boolean {
   return true;
 }
 
-/**
- * Returns candidate models for a category, skipping 404-cached models
- * and capping at max 3 total attempts per request.
- * If all candidate models in a category are temporarily cached as 404,
- * falls back to the primary hardcoded default to avoid starvation.
- */
-export function getCandidateModels(category: keyof ModelCategoryConfig, maxAttempts = 3): string[] {
-  const list = activeModels[category] || defaultModelConfig[category] || HARDCODED_DEFAULTS[category];
-  const candidates = list.filter((modelName) => !isModel404Cached(modelName)).slice(0, maxAttempts);
+// Cooldown memory cache for 503/429 errors: modelName -> expiration timestamp (60 seconds)
+const modelCooldownCache = new Map<string, number>();
+const modelRecent503or429Failures = new Map<string, number>();
+const COOLDOWN_DURATION_MS = 60 * 1000;
 
-  if (candidates.length > 0) {
-    return candidates;
+export function recordModelCooldown(modelName: string): void {
+  const expiresAt = Date.now() + COOLDOWN_DURATION_MS;
+  modelCooldownCache.set(modelName, expiresAt);
+  console.log(`[fallback] Model ${modelName} hit 503/429 limits twice. Cooled down for 60s.`);
+}
+
+export function register503or429Failure(modelName: string): void {
+  const currentCount = (modelRecent503or429Failures.get(modelName) || 0) + 1;
+  modelRecent503or429Failures.set(modelName, currentCount);
+  if (currentCount >= 2) {
+    recordModelCooldown(modelName);
+    modelRecent503or429Failures.delete(modelName);
+  }
+}
+
+export function registerModelSuccess(modelName: string): void {
+  modelRecent503or429Failures.delete(modelName);
+}
+
+export function isModelCoolingDown(modelName: string): boolean {
+  const expiresAt = modelCooldownCache.get(modelName);
+  if (!expiresAt) return false;
+  if (Date.now() > expiresAt) {
+    modelCooldownCache.delete(modelName);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Checks whether an error is retryable (503, 429, or 500) and whether it is a rate/availability issue.
+ */
+export function isRetryableError(err: any): { retryable: boolean; status?: number; isRateOrUnavailable: boolean } {
+  const status = Number(err?.status) || (err?.code === 429 || err?.code === 503 || err?.code === 500 ? Number(err.code) : undefined);
+  const msg = (err?.message || '').toLowerCase();
+
+  const is503 = status === 503 || msg.includes('503') || msg.includes('unavailable');
+  const is429 = status === 429 || msg.includes('429') || msg.includes('resource_exhausted') || msg.includes('quota');
+  const is500 = status === 500 || msg.includes('500') || msg.includes('internal error');
+
+  if (is503) return { retryable: true, status: 503, isRateOrUnavailable: true };
+  if (is429) return { retryable: true, status: 429, isRateOrUnavailable: true };
+  if (is500) return { retryable: true, status: 500, isRateOrUnavailable: false };
+
+  return { retryable: false, status, isRateOrUnavailable: false };
+}
+
+/**
+ * Returns candidate models for a category:
+ * 1. Excludes models that returned 404 (cached for 10m).
+ * 2. Prioritizes normal models first, placing cooling-down models last.
+ * 3. Limits the list up to maxModels.
+ */
+export function getCandidateModels(category: keyof ModelCategoryConfig, maxModels = 4): string[] {
+  const list = activeModels[category] || defaultModelConfig[category] || HARDCODED_DEFAULTS[category];
+
+  // Exclude 404 models
+  const validModels = list.filter((modelName) => !isModel404Cached(modelName));
+
+  if (validModels.length === 0) {
+    return [HARDCODED_DEFAULTS[category][0]];
   }
 
-  // Graceful fallback: return the primary hardcoded model if all were cached as 404
-  return [HARDCODED_DEFAULTS[category][0]];
+  // Ready models first; cooling down models tried last
+  const readyModels = validModels.filter((modelName) => !isModelCoolingDown(modelName));
+  const coolingDownModels = validModels.filter((modelName) => isModelCoolingDown(modelName));
+
+  const prioritized = [...readyModels, ...coolingDownModels];
+  return prioritized.slice(0, maxModels);
+}
+
+/**
+ * Executes a unary model call with resilient fallback:
+ * - Retries the SAME model once after a random 1-2s delay on 503/429/500 errors.
+ * - If a model returns 503 or 429 twice, marks it as cooling down for 60 seconds (skipped first, tried last).
+ * - Caps total attempts per request at max 4.
+ * - Logs each decision in one concise line.
+ */
+export async function executeWithModelFallback<T>(
+  category: keyof ModelCategoryConfig,
+  executeFn: (modelId: string) => Promise<T>
+): Promise<T> {
+  const candidateModels = getCandidateModels(category, 4);
+  let totalAttempts = 0;
+  const MAX_TOTAL_ATTEMPTS = 4;
+  let lastError: any = null;
+
+  for (const modelId of candidateModels) {
+    if (totalAttempts >= MAX_TOTAL_ATTEMPTS) {
+      console.log(`[fallback] Reached max ${MAX_TOTAL_ATTEMPTS} attempts for ${category}.`);
+      break;
+    }
+
+    // Attempt 1 for this model
+    totalAttempts++;
+    console.log(`[fallback] Trying model ${modelId} for ${category} (attempt ${totalAttempts}/${MAX_TOTAL_ATTEMPTS})...`);
+
+    try {
+      const result = await withAttemptTimeout(executeFn(modelId), 30000);
+      registerModelSuccess(modelId);
+      return result;
+    } catch (err: any) {
+      lastError = err;
+
+      if (err?.message === 'CONTENT_SAFETY_BLOCKED') {
+        throw err;
+      }
+
+      if (err?.status === 404 || err?.message?.includes('404') || err?.message?.toLowerCase().includes('not found')) {
+        recordModel404(modelId);
+        continue;
+      }
+
+      const retryInfo = isRetryableError(err);
+      if (retryInfo.isRateOrUnavailable) {
+        register503or429Failure(modelId);
+      }
+
+      if (retryInfo.retryable && totalAttempts < MAX_TOTAL_ATTEMPTS) {
+        const delayMs = Math.floor(1000 + Math.random() * 1000);
+        console.log(`[fallback] Model ${modelId} failed with ${retryInfo.status}. Retrying same model after ${delayMs}ms...`);
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+
+        totalAttempts++;
+        try {
+          const retryResult = await withAttemptTimeout(executeFn(modelId), 30000);
+          registerModelSuccess(modelId);
+          return retryResult;
+        } catch (retryErr: any) {
+          lastError = retryErr;
+
+          if (retryErr?.message === 'CONTENT_SAFETY_BLOCKED') {
+            throw retryErr;
+          }
+
+          const retry2Info = isRetryableError(retryErr);
+          if (retry2Info.isRateOrUnavailable) {
+            register503or429Failure(modelId);
+          }
+          console.log(`[fallback] Model ${modelId} failed retry (${retryErr?.status || 'error'}). Moving to next model.`);
+        }
+      } else {
+        console.log(`[fallback] Model ${modelId} failed (${err?.status || 'error'}). Moving to next model.`);
+      }
+    }
+  }
+
+  throw lastError || new Error('ALL_MODELS_FAILED');
 }
 
 /**
@@ -119,7 +256,6 @@ export async function initializeAndVerifyModels(ai: GoogleGenAI): Promise<void> 
 
       console.log(`[models] Category '${category}': Configured: [${configuredList.join(', ')}] | Available: [${verified.join(', ')}] | Missing/Skipped: [${missing.join(', ')}]`);
 
-      // If at least one verified model exists, use verified; otherwise fallback to hardcoded default
       return verified.length > 0 ? verified : HARDCODED_DEFAULTS[category];
     };
 

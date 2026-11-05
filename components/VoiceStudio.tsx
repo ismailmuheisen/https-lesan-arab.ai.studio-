@@ -1,11 +1,11 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { GeminiService } from '../services/geminiService';
 import { Volume2, Play, Pause, Download, Trash2, Mic, Upload, Sparkles, RefreshCw } from 'lucide-react';
+import { useApp } from '../context/AppContext';
 
 declare global {
   interface Window {
     webkitAudioContext: typeof AudioContext;
-    lamejs: any;
   }
 }
 
@@ -169,14 +169,18 @@ const VoiceStudio: React.FC = () => {
   const animationFrameRef = useRef<number>(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  const { consumePendingTtsText } = useApp();
+
   // Check if text was forwarded from Tashkeel or DeepSearch
   useEffect(() => {
-    const forwardedText = sessionStorage.getItem('lisan_tts_input');
-    if (forwardedText) {
-      setText(forwardedText);
-      sessionStorage.removeItem('lisan_tts_input');
+    const forwardedText = consumePendingTtsText();
+    const legacy = sessionStorage.getItem('lisan_tts_input');
+    const target = forwardedText || legacy;
+    if (target) {
+      setText(target);
+      if (legacy) sessionStorage.removeItem('lisan_tts_input');
     }
-  }, []);
+  }, [consumePendingTtsText]);
 
   // Sync playback speed when audio loads or changes
   useEffect(() => {
@@ -194,10 +198,10 @@ const VoiceStudio: React.FC = () => {
     }, 150);
   };
 
-  const createMp3Blob = (samples: Int16Array, sampleRate: number = 24000) => {
-    const lame = window.lamejs;
-    if (!lame) return null;
+  const createMp3Blob = async (samples: Int16Array, sampleRate: number = 24000): Promise<Blob | null> => {
     try {
+      const lameModule = await import('lamejs');
+      const lame = (lameModule as any).default || lameModule;
       const mp3encoder = new lame.Mp3Encoder(1, sampleRate, 128);
       const mp3Data = [];
       const sampleBlockSize = 1152;
@@ -260,7 +264,7 @@ const VoiceStudio: React.FC = () => {
       if (!hasHeader) {
         // Raw 16-bit linear PCM from Gemini TTS
         const int16Data = new Int16Array(buffer);
-        const mp3Blob = createMp3Blob(int16Data, sampleRate);
+        const mp3Blob = await createMp3Blob(int16Data, sampleRate);
         if (mp3Blob) {
           const url = URL.createObjectURL(mp3Blob);
           setAudioUrl(url);
@@ -289,7 +293,7 @@ const VoiceStudio: React.FC = () => {
           int16Data[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
         }
 
-        const mp3Blob = createMp3Blob(int16Data, decodedSampleRate);
+        const mp3Blob = await createMp3Blob(int16Data, decodedSampleRate);
         if (mp3Blob) {
           const url = URL.createObjectURL(mp3Blob);
           setAudioUrl(url);
@@ -401,7 +405,7 @@ const VoiceStudio: React.FC = () => {
 
       if (!hasAudioHeader(buffer)) {
         const int16Data = new Int16Array(buffer);
-        const mp3Blob = createMp3Blob(int16Data, sampleRate);
+        const mp3Blob = await createMp3Blob(int16Data, sampleRate);
         if (mp3Blob) {
           const url = URL.createObjectURL(mp3Blob);
           setAudioUrl(url);
@@ -759,7 +763,7 @@ const VoiceStudio: React.FC = () => {
                 }`}
               >
                 <span>👨 المجموعة الذكورية</span>
-                <span className="text-[11px] opacity-80">(3 أصوات)</span>
+                <span className="text-xs opacity-80">(3 أصوات)</span>
               </button>
 
               <button
@@ -777,7 +781,7 @@ const VoiceStudio: React.FC = () => {
                 }`}
               >
                 <span>👩 المجموعة الأنثوية</span>
-                <span className="text-[11px] opacity-80">(صوتان)</span>
+                <span className="text-xs opacity-80">(صوتان)</span>
               </button>
 
               {voices.cloned.length > 0 && (
@@ -806,14 +810,14 @@ const VoiceStudio: React.FC = () => {
                     <button
                       key={voice.id}
                       onClick={() => setSelectedVoice(voice.id)}
-                      className={`p-3 rounded-xl border text-right transition-all ${
+                      className={`p-3 rounded-xl border text-start transition-all ${
                         selectedVoice === voice.id 
                           ? 'bg-indigo-500/20 border-indigo-400 text-indigo-100 shadow-sm' 
                           : 'bg-slate-900/40 border-slate-800 text-slate-400 hover:bg-white/5'
                       }`}
                     >
                       <div className="font-bold text-sm">{voice.label}</div>
-                      <div className="text-[11px] text-slate-400">{voice.description}</div>
+                      <div className="text-xs text-slate-400">{voice.description}</div>
                     </button>
                   ))}
                 </div>
@@ -839,7 +843,7 @@ const VoiceStudio: React.FC = () => {
                     <div
                       key={voice.id}
                       onClick={() => setSelectedVoice(voice.id)}
-                      className={`p-3.5 rounded-xl border text-right transition-all cursor-pointer relative group ${
+                      className={`p-3.5 rounded-xl border text-start transition-all cursor-pointer relative group ${
                         selectedVoice === voice.id 
                           ? 'bg-emerald-500/20 border-emerald-400 text-emerald-100 shadow-md shadow-emerald-500/10 ring-1 ring-emerald-400/50' 
                           : 'bg-slate-900/40 border-slate-800 text-slate-400 hover:bg-slate-800/60 hover:text-slate-200 hover:border-slate-700'
@@ -848,7 +852,7 @@ const VoiceStudio: React.FC = () => {
                       <div className="flex items-center justify-between mb-1">
                         <div className="flex items-center gap-1.5">
                           <span className="font-bold text-sm text-white">{voice.label}</span>
-                          <span className="text-[10px] bg-emerald-500/20 text-emerald-300 px-1.5 py-0.5 rounded font-mono">
+                          <span className="text-xs bg-emerald-500/20 text-emerald-300 px-1.5 py-0.5 rounded font-mono">
                             مذكر 👨
                           </span>
                         </div>
@@ -856,7 +860,7 @@ const VoiceStudio: React.FC = () => {
                           <button
                             onClick={(e) => handlePreviewVoice(voice, e)}
                             disabled={previewingVoiceId === voice.id}
-                            className="p-1 rounded-lg bg-slate-800 hover:bg-emerald-600 hover:text-white text-slate-400 transition-colors"
+                            className="p-1 rounded-lg bg-slate-800 hover:bg-emerald-600 hover:text-white text-slate-400 transition-colors cursor-pointer"
                             title={`استماع تجريبي لصوت ${voice.label}`}
                           >
                             {previewingVoiceId === voice.id ? (
@@ -872,7 +876,7 @@ const VoiceStudio: React.FC = () => {
                           )}
                         </div>
                       </div>
-                      <div className="text-[11px] text-slate-400 line-clamp-1">{voice.description}</div>
+                      <div className="text-xs text-slate-400 line-clamp-1">{voice.description}</div>
                     </div>
                   ))}
                 </div>
@@ -898,7 +902,7 @@ const VoiceStudio: React.FC = () => {
                     <div
                       key={voice.id}
                       onClick={() => setSelectedVoice(voice.id)}
-                      className={`p-3.5 rounded-xl border text-right transition-all cursor-pointer relative group ${
+                      className={`p-3.5 rounded-xl border text-start transition-all cursor-pointer relative group ${
                         selectedVoice === voice.id 
                           ? 'bg-purple-500/20 border-purple-400 text-purple-100 shadow-md shadow-purple-500/10 ring-1 ring-purple-400/50' 
                           : 'bg-slate-900/40 border-slate-800 text-slate-400 hover:bg-slate-800/60 hover:text-slate-200 hover:border-slate-700'
@@ -907,7 +911,7 @@ const VoiceStudio: React.FC = () => {
                       <div className="flex items-center justify-between mb-1">
                         <div className="flex items-center gap-1.5">
                           <span className="font-bold text-sm text-white">{voice.label}</span>
-                          <span className="text-[10px] bg-purple-500/20 text-purple-300 px-1.5 py-0.5 rounded font-mono">
+                          <span className="text-xs bg-purple-500/20 text-purple-300 px-1.5 py-0.5 rounded font-mono">
                             مؤنث 👩
                           </span>
                         </div>
@@ -915,7 +919,7 @@ const VoiceStudio: React.FC = () => {
                           <button
                             onClick={(e) => handlePreviewVoice(voice, e)}
                             disabled={previewingVoiceId === voice.id}
-                            className="p-1 rounded-lg bg-slate-800 hover:bg-purple-600 hover:text-white text-slate-400 transition-colors"
+                            className="p-1 rounded-lg bg-slate-800 hover:bg-purple-600 hover:text-white text-slate-400 transition-colors cursor-pointer"
                             title={`استماع تجريبي لصوت ${voice.label}`}
                           >
                             {previewingVoiceId === voice.id ? (
@@ -931,7 +935,7 @@ const VoiceStudio: React.FC = () => {
                           )}
                         </div>
                       </div>
-                      <div className="text-[11px] text-slate-400 line-clamp-1">{voice.description}</div>
+                      <div className="text-xs text-slate-400 line-clamp-1">{voice.description}</div>
                     </div>
                   ))}
                 </div>
@@ -954,7 +958,7 @@ const VoiceStudio: React.FC = () => {
                   <h4 className="text-white font-bold text-base">
                     الصوت: {currentVoiceDetails?.label || selectedVoice}
                   </h4>
-                  <span className={`text-[11px] px-2 py-0.5 rounded-full font-medium ${
+                  <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
                     currentVoiceDetails?.gender === 'male' 
                       ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30' 
                       : 'bg-purple-500/20 text-purple-200 border border-purple-500/30'
@@ -968,7 +972,7 @@ const VoiceStudio: React.FC = () => {
                   </p>
                   <button
                     onClick={toggleVoiceGender}
-                    className="text-[11px] text-amber-400 hover:text-amber-300 underline font-medium transition-colors"
+                    className="text-xs text-amber-400 hover:text-amber-300 underline font-medium transition-colors cursor-pointer"
                   >
                     {currentVoiceDetails?.gender === 'male' ? '🔄 تبديل إلى النبرة الأنثوية' : '🔄 تبديل إلى النبرة الذكورية'}
                   </button>

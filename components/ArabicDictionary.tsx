@@ -20,6 +20,8 @@ import {
   Filter
 } from 'lucide-react';
 import { GeminiService } from '../services/geminiService';
+import { useNavigate } from 'react-router-dom';
+import { useApp } from '../context/AppContext';
 
 interface ArabicDictionaryProps {
   isModal?: boolean;
@@ -34,6 +36,9 @@ export const ArabicDictionary: React.FC<ArabicDictionaryProps> = ({
   initialCategory = 'all',
   onSelectTermForSearch,
 }) => {
+  const navigate = useNavigate();
+  const { setPendingSearchText, setIsDictionaryModalOpen } = useApp();
+
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<TermCategoryKey>(initialCategory);
   const [copiedId, setCopiedId] = useState<string | null>(null);
@@ -170,10 +175,10 @@ ${item.commonMistake ? `تنبيه لغوي: ${item.commonMistake}` : ''}
           </div>
           <div>
             <div className="flex items-center gap-2">
-              <h2 className="text-xl md:text-2xl font-bold font-calligraphy text-amber-300">
+              <h2 id="dictionary-modal-title" className="text-xl md:text-2xl font-bold font-calligraphy text-amber-300">
                 قاموس لسان للمصطلحات النحوية والبلاغية
               </h2>
-              <span className="text-[11px] px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20">
+              <span className="text-xs px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20">
                 {ARABIC_DICTIONARY_TERMS.length} مصطلحاً
               </span>
             </div>
@@ -336,14 +341,14 @@ ${item.commonMistake ? `تنبيه لغوي: ${item.commonMistake}` : ''}
                     key={cat.key}
                     onClick={() => setSelectedCategory(cat.key as TermCategoryKey)}
                     className={`
-                      shrink-0 flex items-center gap-2 px-3.5 py-1.5 rounded-xl text-xs font-medium transition-all
+                      shrink-0 flex items-center gap-2 px-3.5 py-1.5 rounded-xl text-xs font-medium transition-all cursor-pointer
                       ${isSelected
                         ? 'bg-amber-500 text-slate-950 font-bold shadow-md shadow-amber-500/20'
                         : 'bg-slate-900/80 text-slate-300 hover:bg-slate-800 border border-white/5'}
                     `}
                   >
                     <span>{cat.label}</span>
-                    <span className={`text-[10px] px-1.5 py-0.2 rounded-md ${isSelected ? 'bg-slate-950/30 text-slate-900 font-bold' : 'bg-slate-800 text-slate-400'}`}>
+                    <span className={`text-xs px-1.5 py-0.5 rounded-md ${isSelected ? 'bg-slate-950/30 text-slate-900 font-bold' : 'bg-slate-800 text-slate-400'}`}>
                       {count}
                     </span>
                   </button>
@@ -411,14 +416,14 @@ ${item.commonMistake ? `تنبيه لغوي: ${item.commonMistake}` : ''}
                         <div className="flex items-start justify-between gap-3 mb-2.5">
                           <div className="flex-1">
                             <div className="flex items-center gap-2 flex-wrap mb-1">
-                              <span className={`text-[11px] font-medium px-2.5 py-0.5 rounded-lg border ${getCategoryStyles(item.category)}`}>
+                              <span className={`text-xs font-medium px-2.5 py-0.5 rounded-lg border ${getCategoryStyles(item.category)}`}>
                                 {item.categoryLabel}
                               </span>
                               {item.tags?.slice(0, 3).map((tag) => (
                                 <span
                                   key={tag}
                                   onClick={() => setSearchQuery(tag)}
-                                  className="text-[10px] text-slate-500 hover:text-amber-300 cursor-pointer bg-slate-800/60 px-2 py-0.5 rounded-md transition-colors"
+                                  className="text-xs text-slate-500 hover:text-amber-300 cursor-pointer bg-slate-800/60 px-2 py-0.5 rounded-md transition-colors"
                                 >
                                   #{tag}
                                 </span>
@@ -486,9 +491,9 @@ ${item.commonMistake ? `تنبيه لغوي: ${item.commonMistake}` : ''}
 
                             {/* Vocalized Example */}
                             <div className="bg-slate-950/70 rounded-xl p-3 border border-white/10">
-                              <div className="text-[11px] font-bold text-emerald-400 mb-1 flex items-center justify-between">
+                              <div className="text-xs font-bold text-emerald-400 mb-1 flex items-center justify-between">
                                 <span>المثال والشاهد البلاغي:</span>
-                                <span className="text-[10px] text-slate-500">مشكول بالكامل</span>
+                                <span className="text-xs text-slate-500">مشكول بالكامل</span>
                               </div>
                               <p className="font-calligraphy text-base md:text-lg text-emerald-300 leading-relaxed mb-2">
                                 {item.example}
@@ -523,15 +528,22 @@ ${item.commonMistake ? `تنبيه لغوي: ${item.commonMistake}` : ''}
                           <span>شرح معمق بالذكاء الاصطناعي</span>
                         </button>
 
-                        {onSelectTermForSearch && (
-                          <button
-                            onClick={() => onSelectTermForSearch(item.term)}
-                            className="flex items-center gap-1 text-xs text-slate-400 hover:text-slate-200 transition-colors"
-                          >
-                            <span>بحث موسع</span>
-                            <ExternalLink className="w-3 h-3" />
-                          </button>
-                        )}
+                        <button
+                          onClick={() => {
+                            setPendingSearchText(item.term);
+                            if (onSelectTermForSearch) {
+                              onSelectTermForSearch(item.term);
+                            } else {
+                              if (isModal && onClose) onClose();
+                              setIsDictionaryModalOpen(false);
+                              navigate('/search');
+                            }
+                          }}
+                          className="flex items-center gap-1 text-xs text-slate-400 hover:text-amber-300 transition-colors cursor-pointer"
+                        >
+                          <span>بحث موسع</span>
+                          <ExternalLink className="w-3 h-3" />
+                        </button>
                       </div>
                     </div>
                   );
@@ -556,7 +568,7 @@ ${item.commonMistake ? `تنبيه لغوي: ${item.commonMistake}` : ''}
                   <h3 className="font-calligraphy font-bold text-lg md:text-xl text-amber-300">
                     الشرح المعمق: {deepDiveTerm.term}
                   </h3>
-                  <span className="text-[11px] text-slate-400">
+                  <span className="text-xs text-slate-400">
                     مستخرج بواسطة محرك لسان التحقيقي
                   </span>
                 </div>

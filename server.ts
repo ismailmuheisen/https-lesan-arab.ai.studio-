@@ -10,6 +10,10 @@ import {
   getCandidateModels,
   withAttemptTimeout,
   recordModel404,
+  isRetryableError,
+  register503or429Failure,
+  registerModelSuccess,
+  executeWithModelFallback,
 } from './models.config';
 import { splitIntoSentenceChunks, areBaseLettersEqual } from './utils/textUtils';
 import { verifyQuranicVersesInText } from './quranVerification';
@@ -28,7 +32,11 @@ export class ForbiddenError extends Error {
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
-// (3) Helmet security headers with CSP disabled in all environments to allow Vite & fonts/scripts
+// Trust Cloud Run's 1-hop reverse proxy so req.ip and rate-limiting use the real client IP.
+// Placed BEFORE any middleware (helmet, CORS, rateLimiters) to eliminate ERR_ERL_UNEXPECTED_X_FORWARDED_FOR.
+app.set('trust proxy', 1);
+
+// Helmet security headers with CSP disabled in non-production/preview to allow Vite & fonts/scripts
 app.use(
   helmet({
     contentSecurityPolicy: false, // CSP explicitly disabled to prevent blocking Vite or scripts
@@ -57,12 +65,12 @@ const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean)
   : [];
 
-// (1) Dynamic CORS delegate scoped ONLY to /api/* routes
+// Dynamic CORS delegate scoped ONLY to /api/* routes
 const apiCorsDelegate = (req: Request, callback: (err: Error | null, options?: cors.CorsOptions) => void) => {
   const origin = req.headers.origin as string | undefined;
   const host = (req.headers['x-forwarded-host'] as string) || req.headers.host || 'unknown';
 
-  // (3) In non-production, everything is allowed
+  // In non-production, everything is allowed
   if (process.env.NODE_ENV !== 'production') {
     return callback(null, {
       origin: true,
@@ -72,7 +80,7 @@ const apiCorsDelegate = (req: Request, callback: (err: Error | null, options?: c
     });
   }
 
-  // (2) Requests with no Origin header are always allowed (same-origin, curl, server-to-server)
+  // Requests with no Origin header are always allowed (same-origin, curl, server-to-server)
   if (!origin) {
     return callback(null, {
       origin: true,
@@ -82,7 +90,7 @@ const apiCorsDelegate = (req: Request, callback: (err: Error | null, options?: c
     });
   }
 
-  // (2) Same-origin requests are always allowed
+  // Same-origin requests are always allowed
   if (isSameOrigin(origin, req)) {
     return callback(null, {
       origin: true,
@@ -103,7 +111,7 @@ const apiCorsDelegate = (req: Request, callback: (err: Error | null, options?: c
       });
     }
 
-    // (4) Rejection: Log details and supply specific rule
+    // Rejection: Log details and supply specific rule
     console.warn(`[server 403] CORS_ORIGIN_NOT_ALLOWED: origin '${origin}' rejected for host '${host}' on path '${req.originalUrl || req.path}'`);
 
     const forbiddenErr = new ForbiddenError(
@@ -122,10 +130,10 @@ const apiCorsDelegate = (req: Request, callback: (err: Error | null, options?: c
   });
 };
 
-// (1) Apply CORS ONLY to /api/* routes, never to Vite middleware or static files
+// Apply CORS ONLY to /api/* routes, never to Vite middleware or static files
 app.use('/api', cors(apiCorsDelegate));
 
-// Rate limiters applied strictly to /api/gemini routes
+// Rate limiters with default keyGenerator (relies on app.set('trust proxy', 1) for real client IPs)
 const apiLimiter = rateLimit({
   windowMs: 60 * 1000,
   limit: 20,
@@ -212,7 +220,7 @@ function checkSafetyBlock(response: any): SafetyCheckResult {
 }
 
 /**
- * 1. Deep Search & Arabic Linguistics Analysis
+ * 1. Deep Search & Arabic Linguistics Analysis (Streaming with SSE & Resilient Fallback)
  */
 app.post('/api/gemini/deep-search', json15mb, async (req: Request, res: Response): Promise<void> => {
   try {
@@ -304,81 +312,120 @@ app.post('/api/gemini/deep-search', json15mb, async (req: Request, res: Response
       });
     }
 
-    const candidateModels = getCandidateModels('deepSearch', 3);
-    let lastError: any = null;
+    const candidateModels = getCandidateModels('deepSearch', 4);
+    let totalAttempts = 0;
+    const MAX_TOTAL_ATTEMPTS = 4;
+    let streamHandled = false;
 
     for (const modelId of candidateModels) {
-      try {
-        const streamPromise = ai.models.generateContentStream({
-          model: modelId,
-          contents: [{ role: 'user', parts }],
-          config: {
-            systemInstruction,
-          },
-        });
+      if (totalAttempts >= MAX_TOTAL_ATTEMPTS) {
+        console.log(`[fallback] Reached max ${MAX_TOTAL_ATTEMPTS} attempts for deepSearch.`);
+        break;
+      }
 
-        const stream = await withAttemptTimeout(streamPromise, 30000);
+      const runStreamAttempt = async (isRetry: boolean): Promise<boolean> => {
+        totalAttempts++;
+        console.log(`[fallback] ${isRetry ? 'Retrying' : 'Trying'} model ${modelId} for deepSearch (attempt ${totalAttempts}/${MAX_TOTAL_ATTEMPTS})...`);
 
-        let fullAccumulatedText = '';
-        let isFirst = true;
-        let isBlocked = false;
+        try {
+          const streamPromise = ai.models.generateContentStream({
+            model: modelId,
+            contents: [{ role: 'user', parts }],
+            config: {
+              systemInstruction,
+            },
+          });
 
-        for await (const chunk of stream) {
-          if (isFirst) {
-            const safety = checkSafetyBlock(chunk);
-            if (safety.blocked) {
-              isBlocked = true;
-              sendEvent('error', {
-                error: 'تعذر إتمام البحث لمخالفته معايير الأمان وسلامة المحتوى.',
-                code: 'CONTENT_SAFETY_BLOCKED',
-              });
-              break;
+          const stream = await withAttemptTimeout(streamPromise, 30000);
+
+          let fullAccumulatedText = '';
+          let isFirst = true;
+          let isBlocked = false;
+
+          for await (const chunk of stream) {
+            if (isFirst) {
+              const safety = checkSafetyBlock(chunk);
+              if (safety.blocked) {
+                isBlocked = true;
+                sendEvent('error', {
+                  error: 'تعذر إتمام البحث لمخالفته معايير الأمان وسلامة المحتوى.',
+                  code: 'CONTENT_SAFETY_BLOCKED',
+                });
+                break;
+              }
+              isFirst = false;
             }
-            isFirst = false;
+
+            const token = chunk.text || '';
+            if (token) {
+              fullAccumulatedText += token;
+              sendEvent('token', { token });
+            }
           }
 
-          const token = chunk.text || '';
-          if (token) {
-            fullAccumulatedText += token;
-            sendEvent('token', { token });
+          if (isBlocked) {
+            res.end();
+            return true;
           }
-        }
 
-        if (isBlocked) {
+          if (!fullAccumulatedText) {
+            throw new Error('EMPTY_RESPONSE');
+          }
+
+          registerModelSuccess(modelId);
+
+          // Verify Quranic verses against api.alquran.cloud (Uthmani edition)
+          const verifiedFullText = await verifyQuranicVersesInText(fullAccumulatedText);
+
+          sendEvent('done', {
+            fullText: verifiedFullText,
+            verified: verifiedFullText !== fullAccumulatedText,
+          });
+
           res.end();
-          return;
+          return true;
+        } catch (err: any) {
+          if (err?.message === 'CONTENT_SAFETY_BLOCKED') {
+            throw err;
+          }
+
+          if (err?.status === 404 || err?.message?.includes('404') || err?.message?.toLowerCase().includes('not found')) {
+            recordModel404(modelId);
+            return false;
+          }
+
+          const retryInfo = isRetryableError(err);
+          if (retryInfo.isRateOrUnavailable) {
+            register503or429Failure(modelId);
+          }
+
+          if (retryInfo.retryable && !isRetry && totalAttempts < MAX_TOTAL_ATTEMPTS) {
+            const delayMs = Math.floor(1000 + Math.random() * 1000);
+            console.log(`[fallback] Model ${modelId} failed with ${retryInfo.status}. Retrying same model after ${delayMs}ms...`);
+            await new Promise((r) => setTimeout(r, delayMs));
+            return runStreamAttempt(true);
+          }
+
+          console.log(`[fallback] Model ${modelId} failed (${err?.status || err?.code || 'error'}). Moving to next model.`);
+          return false;
         }
+      };
 
-        if (!fullAccumulatedText) {
-          console.warn(`[server] Model ${modelId} returned no tokens, trying next model.`);
-          continue;
-        }
-
-        // Verify Quranic verses against api.alquran.cloud (Uthmani edition)
-        const verifiedFullText = await verifyQuranicVersesInText(fullAccumulatedText);
-
-        sendEvent('done', {
-          fullText: verifiedFullText,
-          verified: verifiedFullText !== fullAccumulatedText,
-        });
-
-        res.end();
-        return;
-      } catch (err: any) {
-        lastError = err;
-        if (err?.status === 404 || err?.message?.includes('404') || err?.message?.toLowerCase().includes('not found')) {
-          recordModel404(modelId);
-        }
-        console.warn(`[server] Model ${modelId} failed for deepSearch:`, err?.message || err);
+      const success = await runStreamAttempt(false);
+      if (success) {
+        streamHandled = true;
+        break;
       }
     }
 
-    console.error('[server] All candidate models failed in deep-search:', lastError);
-    sendEvent('error', {
-      error: 'تعذر الحصول على استجابة من محرك البحث اللغوي حالياً. يرجى المحاولة لاحقاً.',
-      code: 'AI_SERVICE_UNAVAILABLE',
-    });
-    res.end();
+    if (!streamHandled) {
+      console.error('[server] All candidate models failed in deep-search fallback chain.');
+      sendEvent('error', {
+        error: 'تعذر الحصول على استجابة من محرك البحث اللغوي حالياً. يرجى المحاولة لاحقاً.',
+        code: 'AI_SERVICE_UNAVAILABLE',
+      });
+      res.end();
+    }
   } catch (error: any) {
     console.error('[server] Error in deep-search endpoint:', error);
     if (!res.headersSent) {
@@ -387,14 +434,14 @@ app.post('/api/gemini/deep-search', json15mb, async (req: Request, res: Response
         code: 'INTERNAL_SERVER_ERROR',
       });
     } else {
-      res.write(`event: error\ndata: ${JSON.stringify({ error: 'حدث خطأ غير متوقع.', code: 'INTERNAL_SERVER_ERROR' })}\n\n`);
+      res.write(`event: error\ndata: ${JSON.stringify({ error: 'حدث خطأ غير متوقع في المعالجة.', code: 'INTERNAL_SERVER_ERROR' })}\n\n`);
       res.end();
     }
   }
 });
 
 /**
- * 2. Tashkeel (Diacritization) & Proofreading
+ * 2. Tashkeel (Diacritization) & Proofreading with Resilient Fallback
  */
 app.post('/api/gemini/tashkeel', json100kb, async (req: Request, res: Response): Promise<void> => {
   try {
@@ -428,7 +475,6 @@ app.post('/api/gemini/tashkeel', json100kb, async (req: Request, res: Response):
     }
 
     const chunks = splitIntoSentenceChunks(text, 1500);
-    const candidateModels = getCandidateModels('tashkeel', 3);
 
     const generateChunkDiacritics = async (chunkText: string, retryNotice = false): Promise<string> => {
       let chunkPrompt = `${promptInstruction}\n\nالنص:\n${chunkText}`;
@@ -436,38 +482,27 @@ app.post('/api/gemini/tashkeel', json100kb, async (req: Request, res: Response):
         chunkPrompt += `\n\nتنبيه مهم: يرجى المحافظة الدقيقة على الحروف والكلمات الأصلية كما هي دون حذف أو تعديل أو إضافة أي كلمة، واقتصر على وضع حركات التشكيل.`;
       }
 
-      let lastChunkErr: any = null;
+      return executeWithModelFallback('tashkeel', async (modelId) => {
+        const genPromise = ai.models.generateContent({
+          model: modelId,
+          contents: chunkPrompt,
+          config: {
+            temperature: 0.2,
+          },
+        });
 
-      for (const modelId of candidateModels) {
-        try {
-          const genPromise = ai.models.generateContent({
-            model: modelId,
-            contents: chunkPrompt,
-            config: {
-              temperature: 0.2,
-            },
-          });
+        const response = await withAttemptTimeout(genPromise, 30000);
 
-          const response = await withAttemptTimeout(genPromise, 30000);
-
-          const safety = checkSafetyBlock(response);
-          if (safety.blocked) {
-            throw new Error('CONTENT_SAFETY_BLOCKED');
-          }
-
-          if (response.text) {
-            return response.text.trim();
-          }
-        } catch (err: any) {
-          lastChunkErr = err;
-          if (err?.status === 404 || err?.message?.includes('404') || err?.message?.toLowerCase().includes('not found')) {
-            recordModel404(modelId);
-          }
-          console.warn(`[server] Model ${modelId} failed for tashkeel chunk:`, err?.message || err);
+        const safety = checkSafetyBlock(response);
+        if (safety.blocked) {
+          throw new Error('CONTENT_SAFETY_BLOCKED');
         }
-      }
 
-      throw lastChunkErr || new Error('FAILED_ALL_MODELS');
+        if (response.text) {
+          return response.text.trim();
+        }
+        throw new Error('EMPTY_RESPONSE');
+      });
     };
 
     const processedChunks: string[] = [];
@@ -514,15 +549,15 @@ app.post('/api/gemini/tashkeel', json100kb, async (req: Request, res: Response):
       });
       return;
     }
-    res.status(500).json({
-      error: 'حدث خطأ في الخادم أثناء معالجة تشكيل النص.',
-      code: 'INTERNAL_SERVER_ERROR',
+    res.status(502).json({
+      error: 'تعذر تشكيل النص في الوقت الحالي. يرجى المحاولة لاحقاً.',
+      code: 'TASHKEEL_FAILED',
     });
   }
 });
 
 /**
- * 3. Arabic Calligraphy & Islamic Art Generation
+ * 3. Arabic Calligraphy & Islamic Art Generation with Resilient Fallback
  */
 app.post('/api/gemini/art', artLimiter, json100kb, async (req: Request, res: Response): Promise<void> => {
   try {
@@ -566,62 +601,51 @@ app.post('/api/gemini/art', artLimiter, json100kb, async (req: Request, res: Res
 
     const enhancedPrompt = `${styleDesc} ${atmosphereDesc} The central Arabic text clearly depicted is: "${prompt}". Museum-grade, ultra-detailed composition, pristine typography with no scrambled characters.`;
 
-    const candidateImageModels = getCandidateModels('art', 3);
-    let lastError: any = null;
+    const imageDataUrl = await executeWithModelFallback('art', async (modelId) => {
+      const artPromise = ai.models.generateContent({
+        model: modelId,
+        contents: { parts: [{ text: enhancedPrompt }] },
+      });
 
-    for (const modelId of candidateImageModels) {
-      try {
-        const artPromise = ai.models.generateContent({
-          model: modelId,
-          contents: { parts: [{ text: enhancedPrompt }] },
-        });
+      const response = await withAttemptTimeout(artPromise, 30000);
 
-        const response = await withAttemptTimeout(artPromise, 30000);
+      const safety = checkSafetyBlock(response);
+      if (safety.blocked) {
+        console.warn(`[server] Art generation blocked by safety:`, safety.reason);
+        throw new Error('CONTENT_SAFETY_BLOCKED');
+      }
 
-        const safety = checkSafetyBlock(response);
-        if (safety.blocked) {
-          console.warn(`[server] Art generation blocked by safety:`, safety.reason);
-          res.status(422).json({
-            error: 'تعذر توليد اللوحة الفنية لمخالفتها معايير الأمان وسلامة المحتوى.',
-            code: 'CONTENT_SAFETY_BLOCKED',
-          });
-          return;
-        }
-
-        for (const candidate of response.candidates || []) {
-          const parts = candidate.content?.parts ?? [];
-          for (const part of parts) {
-            if (part.inlineData && part.inlineData.mimeType?.startsWith('image')) {
-              res.json({ image: `data:${part.inlineData.mimeType};base64,${part.inlineData.data}` });
-              return;
-            }
+      for (const candidate of response.candidates || []) {
+        const parts = candidate.content?.parts ?? [];
+        for (const part of parts) {
+          if (part.inlineData && part.inlineData.mimeType?.startsWith('image')) {
+            return `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
           }
         }
-      } catch (err: any) {
-        lastError = err;
-        if (err?.status === 404 || err?.message?.includes('404') || err?.message?.toLowerCase().includes('not found')) {
-          recordModel404(modelId);
-        }
-        console.warn(`[server] Image model ${modelId} failed:`, err?.message || err);
       }
-    }
 
-    console.error('[server] All art models failed:', lastError);
+      throw new Error('NO_IMAGE_DATA');
+    });
+
+    res.json({ image: imageDataUrl });
+  } catch (error: any) {
+    console.error('[server] Error in art generation:', error);
+    if (error?.message === 'CONTENT_SAFETY_BLOCKED') {
+      res.status(422).json({
+        error: 'تعذر توليد اللوحة الفنية لمخالفتها معايير الأمان وسلامة المحتوى.',
+        code: 'CONTENT_SAFETY_BLOCKED',
+      });
+      return;
+    }
     res.status(502).json({
       error: 'تعذر توليد اللوحة الفنية حالياً. يرجى إعادة المحاولة بنص أو أسلوب مختلف.',
       code: 'IMAGE_GENERATION_FAILED',
-    });
-  } catch (error: any) {
-    console.error('[server] Error in art generation:', error);
-    res.status(500).json({
-      error: 'حدث خطأ في الخادم أثناء توليد اللوحة الفنية.',
-      code: 'INTERNAL_SERVER_ERROR',
     });
   }
 });
 
 /**
- * 4. Text to Speech (TTS)
+ * 4. Text to Speech (TTS) with Resilient Fallback
  */
 app.post('/api/gemini/speech', speechLimiter, json100kb, async (req: Request, res: Response): Promise<void> => {
   try {
@@ -664,9 +688,6 @@ app.post('/api/gemini/speech', speechLimiter, json100kb, async (req: Request, re
       effectiveVoice = DISTINCT_FEMALE_VOICES.includes(voiceName) ? voiceName : 'Zephyr';
     }
 
-    const candidateModels = getCandidateModels('speech', 3);
-    let lastError: any = null;
-
     const speechContents = [
       {
         role: 'user',
@@ -681,67 +702,59 @@ app.post('/api/gemini/speech', speechLimiter, json100kb, async (req: Request, re
       },
     ];
 
-    for (const modelId of candidateModels) {
-      try {
-        const ttsPromise = ai.models.generateContent({
-          model: modelId,
-          contents: speechContents,
-          config: {
-            responseModalities: [Modality.AUDIO],
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: { voiceName: effectiveVoice },
-              },
+    const audioResult = await executeWithModelFallback('speech', async (modelId) => {
+      const ttsPromise = ai.models.generateContent({
+        model: modelId,
+        contents: speechContents,
+        config: {
+          responseModalities: [Modality.AUDIO],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: { voiceName: effectiveVoice },
             },
           },
-        });
+        },
+      });
 
-        const response = await withAttemptTimeout(ttsPromise, 30000);
+      const response = await withAttemptTimeout(ttsPromise, 30000);
 
-        const safety = checkSafetyBlock(response);
-        if (safety.blocked) {
-          console.warn(`[server] Speech generation blocked by safety:`, safety.reason);
-          res.status(422).json({
-            error: 'تعذر توليد النطق الصوتي لمخالفته معايير الأمان وسلامة المحتوى.',
-            code: 'CONTENT_SAFETY_BLOCKED',
-          });
-          return;
-        }
-
-        const candidate = response.candidates?.[0];
-        const parts = candidate?.content?.parts ?? [];
-        const audioPart = parts[0]?.inlineData;
-        const base64Audio = audioPart?.data;
-        const mimeType = audioPart?.mimeType || 'audio/wav';
-
-        if (base64Audio) {
-          res.json({ base64Audio, mimeType });
-          return;
-        }
-      } catch (err: any) {
-        lastError = err;
-        if (err?.status === 404 || err?.message?.includes('404') || err?.message?.toLowerCase().includes('not found')) {
-          recordModel404(modelId);
-        }
-        console.warn(`[server] TTS model ${modelId} failed:`, err?.message || err);
+      const safety = checkSafetyBlock(response);
+      if (safety.blocked) {
+        console.warn(`[server] Speech generation blocked by safety:`, safety.reason);
+        throw new Error('CONTENT_SAFETY_BLOCKED');
       }
-    }
 
-    console.error('[server] All models failed in speech generation:', lastError);
+      const candidate = response.candidates?.[0];
+      const parts = candidate?.content?.parts ?? [];
+      const audioPart = parts[0]?.inlineData;
+      const base64Audio = audioPart?.data;
+      const mimeType = audioPart?.mimeType || 'audio/wav';
+
+      if (base64Audio) {
+        return { base64Audio, mimeType };
+      }
+
+      throw new Error('NO_AUDIO_DATA');
+    });
+
+    res.json(audioResult);
+  } catch (error: any) {
+    console.error('[server] Error in speech generation:', error);
+    if (error?.message === 'CONTENT_SAFETY_BLOCKED') {
+      res.status(422).json({
+        error: 'تعذر توليد النطق الصوتي لمخالفته معايير الأمان وسلامة المحتوى.',
+        code: 'CONTENT_SAFETY_BLOCKED',
+      });
+      return;
+    }
     res.status(502).json({
       error: 'تعذر توليد الصوت في الوقت الحالي. يرجى إعادة المحاولة لاحقاً.',
       code: 'SPEECH_GENERATION_FAILED',
     });
-  } catch (error: any) {
-    console.error('[server] Error in speech generation:', error);
-    res.status(500).json({
-      error: 'حدث خطأ في الخادم أثناء توليد الصوت.',
-      code: 'INTERNAL_SERVER_ERROR',
-    });
   }
 });
 
-// (4) Centralized API Error Handler: Logs origin/host and returns JSON body specifying the exact rule on 403
+// Centralized API Error Handler: Logs origin/host and returns JSON body specifying the exact rule on 403
 app.use('/api', (err: any, req: Request, res: Response, _next: NextFunction) => {
   const host = (req.headers['x-forwarded-host'] as string) || req.headers.host || 'unknown';
   const origin = (req.headers.origin as string) || 'none';
@@ -801,8 +814,9 @@ async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
     try {
       const { createServer } = await import('vite');
+      // Silencing Vite HMR websocket connection safely with hmr: false in middlewareMode
       const vite = await createServer({
-        server: { middlewareMode: true },
+        server: { middlewareMode: true, hmr: false },
         appType: 'spa',
       });
       app.use(vite.middlewares);

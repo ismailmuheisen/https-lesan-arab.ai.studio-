@@ -1,8 +1,10 @@
 import React, { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { GeminiService } from '../services/geminiService';
 import { TashkeelMode } from '../types';
 import { motion, AnimatePresence } from 'motion/react';
 import { Copy, Trash2, Wand2, Check, AlertCircle, Info, Volume2, Sparkles, BookOpen } from 'lucide-react';
+import { useApp } from '../context/AppContext';
 
 interface TashkeelToolProps {
   onSendToVoiceStudio?: (text: string) => void;
@@ -15,6 +17,9 @@ const SAMPLE_TEXTS = [
 ];
 
 const TashkeelTool: React.FC<TashkeelToolProps> = ({ onSendToVoiceStudio }) => {
+  const navigate = useNavigate();
+  const { setPendingTtsText } = useApp();
+
   const [inputText, setInputText] = useState('');
   const [outputText, setOutputText] = useState('');
   const [mode, setMode] = useState<TashkeelMode>('full');
@@ -58,8 +63,11 @@ const TashkeelTool: React.FC<TashkeelToolProps> = ({ onSendToVoiceStudio }) => {
   const handleSendToTTS = () => {
     if (!outputText && !inputText) return;
     const textToSpeak = outputText || inputText;
+    setPendingTtsText(textToSpeak);
     if (onSendToVoiceStudio) {
       onSendToVoiceStudio(textToSpeak);
+    } else {
+      navigate('/voice');
     }
   };
 
@@ -72,7 +80,7 @@ const TashkeelTool: React.FC<TashkeelToolProps> = ({ onSendToVoiceStudio }) => {
         className="mb-6 border-b border-white/10 pb-4 flex flex-col md:flex-row justify-between items-start md:items-end gap-4"
       >
         <div>
-          <h2 className="text-3xl font-calligraphy text-amber-400 mb-1 flex items-center gap-3">
+          <h2 className="text-2xl md:text-3xl font-calligraphy text-amber-400 mb-1 flex items-center gap-3">
             <Wand2 className="w-8 h-8 text-amber-400" />
             المشكّل والمدقق اللغوي الذكي
           </h2>
@@ -85,7 +93,7 @@ const TashkeelTool: React.FC<TashkeelToolProps> = ({ onSendToVoiceStudio }) => {
         <div className="flex bg-slate-900/80 rounded-xl p-1 border border-white/10 text-xs md:text-sm">
           <button
             onClick={() => setMode('full')}
-            className={`px-3.5 py-1.5 rounded-lg transition-all ${
+            className={`px-3.5 py-1.5 rounded-lg transition-all cursor-pointer ${
               mode === 'full' 
                 ? 'bg-amber-500 text-slate-950 font-bold shadow-sm' 
                 : 'text-slate-400 hover:text-white'
@@ -95,7 +103,7 @@ const TashkeelTool: React.FC<TashkeelToolProps> = ({ onSendToVoiceStudio }) => {
           </button>
           <button
             onClick={() => setMode('ending')}
-            className={`px-3.5 py-1.5 rounded-lg transition-all ${
+            className={`px-3.5 py-1.5 rounded-lg transition-all cursor-pointer ${
               mode === 'ending' 
                 ? 'bg-amber-500 text-slate-950 font-bold shadow-sm' 
                 : 'text-slate-400 hover:text-white'
@@ -105,7 +113,7 @@ const TashkeelTool: React.FC<TashkeelToolProps> = ({ onSendToVoiceStudio }) => {
           </button>
           <button
             onClick={() => setMode('proofread')}
-            className={`px-3.5 py-1.5 rounded-lg transition-all ${
+            className={`px-3.5 py-1.5 rounded-lg transition-all cursor-pointer ${
               mode === 'proofread' 
                 ? 'bg-amber-500 text-slate-950 font-bold shadow-sm' 
                 : 'text-slate-400 hover:text-white'
@@ -126,7 +134,7 @@ const TashkeelTool: React.FC<TashkeelToolProps> = ({ onSendToVoiceStudio }) => {
           <button
             key={idx}
             onClick={() => setInputText(sample.text)}
-            className="text-xs bg-slate-800/60 hover:bg-slate-700/80 text-slate-300 hover:text-amber-300 px-3 py-1 rounded-lg border border-slate-700/50 transition-colors"
+            className="text-xs bg-slate-800/60 hover:bg-slate-700/80 text-slate-300 hover:text-amber-300 px-3 py-1 rounded-lg border border-slate-700/50 transition-colors cursor-pointer"
           >
             {sample.label}
           </button>
@@ -145,7 +153,7 @@ const TashkeelTool: React.FC<TashkeelToolProps> = ({ onSendToVoiceStudio }) => {
             {inputText && (
               <button 
                 onClick={clearInput}
-                className="text-slate-500 hover:text-red-400 text-xs flex items-center gap-1 transition-colors"
+                className="text-slate-500 hover:text-red-400 text-xs flex items-center gap-1 transition-colors cursor-pointer"
                 title="مسح النص"
               >
                 <Trash2 className="w-3.5 h-3.5" />
@@ -157,7 +165,7 @@ const TashkeelTool: React.FC<TashkeelToolProps> = ({ onSendToVoiceStudio }) => {
           <div className="relative flex-1 group">
             <textarea 
               id="tashkeel-input"
-              className="w-full h-full min-h-[280px] bg-slate-800/30 border border-slate-700/60 rounded-2xl p-5 text-xl leading-loose font-sans text-white focus:ring-2 focus:ring-emerald-500/50 focus:border-emerald-500 outline-none resize-none transition-all"
+              className="w-full h-full min-h-[280px] bg-slate-800/30 border border-slate-700/60 rounded-2xl p-5 text-[17px] md:text-xl leading-loose font-sans text-white focus:ring-2 focus:ring-emerald-500/50 focus:border-emerald-500 outline-none resize-none transition-all"
               placeholder="اكتب أو الصق النص العربي هنا لتشكيله أو تدقيقه..."
               value={inputText}
               onChange={(e) => setInputText(e.target.value)}
@@ -182,7 +190,7 @@ const TashkeelTool: React.FC<TashkeelToolProps> = ({ onSendToVoiceStudio }) => {
                     animate={{ opacity: 1, scale: 1 }}
                     exit={{ opacity: 0, scale: 0.9 }}
                     onClick={copyToClipboard} 
-                    className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium transition-all ${
+                    className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium transition-all cursor-pointer ${
                       copying 
                         ? 'bg-emerald-500 text-white shadow-md shadow-emerald-500/20' 
                         : 'bg-white/10 hover:bg-white/20 text-white border border-white/10'
@@ -206,7 +214,7 @@ const TashkeelTool: React.FC<TashkeelToolProps> = ({ onSendToVoiceStudio }) => {
                     animate={{ opacity: 1, scale: 1 }}
                     exit={{ opacity: 0, scale: 0.9 }}
                     onClick={handleSendToTTS} 
-                    className="flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 transition-all"
+                    className="flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 transition-all cursor-pointer"
                     title="نقل النص المشكول إلى الناطق الآلي للاستماع إليه"
                   >
                     <Volume2 className="w-3.5 h-3.5" />
@@ -218,81 +226,53 @@ const TashkeelTool: React.FC<TashkeelToolProps> = ({ onSendToVoiceStudio }) => {
           </div>
 
           <div className="relative flex-1 group">
-             <div className={`w-full h-full min-h-[280px] bg-slate-900/60 border ${
-               error ? 'border-red-500/50' : 'border-amber-500/30'
-             } rounded-2xl p-5 relative overflow-hidden transition-all duration-300`}>
-                {loading && (
-                  <motion.div 
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    className="absolute inset-0 bg-slate-950/80 backdrop-blur-sm flex flex-col items-center justify-center z-10 p-6 text-center"
-                  >
-                    <div className="w-12 h-12 border-3 border-amber-500/20 border-t-amber-500 rounded-full animate-spin mb-3" />
-                    <div className="text-amber-400 font-calligraphy text-2xl animate-pulse">جاري الضبط والتدقيق اللغوي...</div>
-                    <p className="text-slate-400 text-xs mt-1 font-sans">تطبيق قواعد الإعراب والصرف والبيان</p>
-                  </motion.div>
-                )}
-
-                {error && (
-                  <div className="flex flex-col items-center justify-center h-full text-red-400 p-6 text-center bg-red-500/5 rounded-xl border border-red-500/20">
-                    <AlertCircle className="w-10 h-10 mb-3 opacity-60" />
-                    <p className="text-sm font-sans">{error}</p>
-                    <button 
-                      onClick={handleTashkeel}
-                      className="mt-3 text-xs bg-red-500/20 hover:bg-red-500/30 text-red-200 px-4 py-1.5 rounded-lg border border-red-500/30 transition-colors"
-                    >
-                      إعادة المحاولة
-                    </button>
-                  </div>
-                )}
-
-                {!loading && !error && (
-                  <div className="flex flex-col h-full">
-                    <textarea 
-                      readOnly
-                      className="w-full flex-1 bg-transparent border-none outline-none text-xl md:text-2xl leading-loose font-sans text-emerald-100 placeholder:text-slate-700 resize-none"
-                      value={outputText}
-                      placeholder="ستظهر النتيجة المشكولة والمضبوطة هنا..."
-                    />
-                    {warning && (
-                      <div className="flex items-center gap-2 p-3 bg-amber-500/10 border border-amber-500/30 rounded-xl text-amber-300 text-xs mt-2 animate-in fade-in">
-                        <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" />
-                        <span>{warning}</span>
-                      </div>
-                    )}
-                  </div>
-                )}
-             </div>
+            <textarea 
+              id="tashkeel-output"
+              readOnly
+              className={`w-full h-full min-h-[280px] bg-slate-900/40 border border-white/10 rounded-2xl p-5 text-[17px] md:text-xl leading-loose font-sans text-amber-200 outline-none resize-none transition-all ${
+                loading ? 'animate-pulse opacity-60' : ''
+              }`}
+              placeholder="ستظهر النتيجة المشكولة هنا بدقة وإتقان..."
+              value={loading ? 'جاري استحضار القواعد وضبط التشكيل...' : outputText}
+            />
           </div>
         </div>
       </div>
 
-      {/* Action Submit Button */}
-      <div className="flex justify-center mt-6 pb-2">
-        <motion.button 
-          id="tashkeel-submit"
-          whileHover={{ scale: 1.02 }}
-          whileTap={{ scale: 0.98 }}
+      {/* Warning / Error banners */}
+      {warning && (
+        <div className="mt-4 p-3 bg-amber-500/10 border border-amber-500/30 rounded-xl text-amber-300 text-xs flex items-center gap-2">
+          <Info className="w-4 h-4 shrink-0 text-amber-400" />
+          <span>{warning}</span>
+        </div>
+      )}
+
+      {error && (
+        <div className="mt-4 p-3 bg-red-500/10 border border-red-500/30 rounded-xl text-red-300 text-xs flex items-center gap-2">
+          <AlertCircle className="w-4 h-4 shrink-0 text-red-400" />
+          <span>{error}</span>
+        </div>
+      )}
+
+      {/* Submit Button Bar */}
+      <div className="mt-6 flex justify-end">
+        <button
           onClick={handleTashkeel}
           disabled={loading || !inputText.trim()}
-          className="group relative bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-slate-950 font-bold font-sans text-lg px-12 py-3.5 rounded-2xl shadow-[0_8px_25px_rgba(245,158,11,0.25)] disabled:opacity-30 disabled:cursor-not-allowed transition-all border border-amber-400/20"
+          className="w-full sm:w-auto px-8 py-3.5 rounded-xl bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-600 hover:to-amber-700 text-slate-950 font-bold text-sm md:text-base shadow-lg shadow-amber-500/20 disabled:opacity-40 disabled:cursor-not-allowed transition-all flex items-center justify-center gap-2 cursor-pointer"
         >
-          <div className="flex items-center gap-2.5">
-            {loading ? (
-              <>
-                <span className="w-4 h-4 border-2 border-slate-950 border-t-transparent rounded-full animate-spin" />
-                <span>جاري معالجة النص...</span>
-              </>
-            ) : (
-              <>
-                <Wand2 className="w-5 h-5 group-hover:rotate-12 transition-transform" />
-                <span>
-                  {mode === 'full' ? 'تشكيل النص كاملاً' : mode === 'ending' ? 'ضبط أواخر الكلمات' : 'تدقيق وتصويب لغوي'}
-                </span>
-              </>
-            )}
-          </div>
-        </motion.button>
+          {loading ? (
+            <>
+              <div className="w-4 h-4 border-2 border-slate-950 border-t-transparent rounded-full animate-spin" />
+              <span>جاري التشكيل والتدقيق...</span>
+            </>
+          ) : (
+            <>
+              <Wand2 className="w-4 h-4" />
+              <span>تنفيذ التشكيل والتدقيق اللغوي</span>
+            </>
+          )}
+        </button>
       </div>
     </div>
   );
