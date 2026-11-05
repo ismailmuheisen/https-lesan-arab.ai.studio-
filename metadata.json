@@ -1,0 +1,10 @@
+{
+  "name": "Remix لسان الذكاء العربي",
+  "description": "تطبيق خبير لعلوم اللغة العربية، القواعد، البيان، العروض، التشكيل، والفنون. مدعوم بالذكاء الاصطناعي.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
