@@ -144,7 +144,10 @@ const DeepSearch: React.FC<DeepSearchProps> = ({ onNavigateToTashkeel, onOpenDic
       : q;
 
     const userMsg: Message = { id: Date.now().toString(), role: 'user', content: displayContent };
-    setHistory(prev => [...prev, userMsg]);
+    const aiMsgId = (Date.now() + 1).toString();
+    const initialAiMsg: Message = { id: aiMsgId, role: 'model', content: '' };
+
+    setHistory(prev => [...prev, userMsg, initialAiMsg]);
     setQuery('');
     setLoading(true);
 
@@ -165,20 +168,18 @@ const DeepSearch: React.FC<DeepSearchProps> = ({ onNavigateToTashkeel, onOpenDic
       const responseText = await GeminiService.deepSearch(
         finalQuery, 
         context, 
-        filePayload
+        filePayload,
+        (streamedText) => {
+          setHistory(prev => prev.map(m => (m.id === aiMsgId ? { ...m, content: streamedText } : m)));
+        }
       );
       
-      const aiMsg: Message = { id: (Date.now() + 1).toString(), role: 'model', content: responseText };
-      setHistory(prev => [...prev, aiMsg]);
+      setHistory(prev => prev.map(m => (m.id === aiMsgId ? { ...m, content: responseText } : m)));
       clearAttachment();
-    } catch (error) {
+    } catch (error: any) {
       console.error(error);
-      const errorMsg: Message = { 
-        id: Date.now().toString(), 
-        role: 'model', 
-        content: 'عذراً، حدث خطأ أثناء الاتصال بالباحث اللغوي. يرجى المحاولة مرة أخرى والتأكد من صياغة السؤال أو سلامة الملف المرفق.' 
-      };
-      setHistory(prev => [...prev, errorMsg]);
+      const errorMsg = error?.message || 'عذراً، حدث خطأ أثناء الاتصال بالباحث اللغوي. يرجى المحاولة مرة أخرى والتأكد من صياغة السؤال أو سلامة الملف المرفق.';
+      setHistory(prev => prev.map(m => (m.id === aiMsgId ? { ...m, content: errorMsg } : m)));
     } finally {
       setLoading(false);
     }
@@ -367,10 +368,15 @@ const DeepSearch: React.FC<DeepSearchProps> = ({ onNavigateToTashkeel, onOpenDic
               )}
 
               <div className="font-sans text-base md:text-lg leading-relaxed whitespace-pre-wrap selection:bg-amber-500/30">
-                {msg.content}
+                {msg.content || (msg.role === 'model' && loading ? (
+                  <div className="flex items-center gap-2.5 text-amber-300 py-1">
+                    <div className="w-3.5 h-3.5 border-2 border-amber-400 border-t-transparent rounded-full animate-spin" />
+                    <span className="text-sm font-sans animate-pulse">الباحث يستقرئ المعاجم ويستنبط الإعراب...</span>
+                  </div>
+                ) : null)}
               </div>
               
-              {msg.role === 'model' && (
+              {msg.role === 'model' && msg.content && (
                 <div className="mt-4 pt-3 border-t border-white/10 flex flex-wrap items-center justify-between gap-2 text-xs">
                   <div className="flex items-center gap-1.5">
                     <button 
@@ -419,11 +425,11 @@ const DeepSearch: React.FC<DeepSearchProps> = ({ onNavigateToTashkeel, onOpenDic
           </div>
         ))}
         
-        {loading && (
+        {loading && history[history.length - 1]?.content && (
           <div className="flex justify-end">
-            <div className="bg-slate-900/90 p-4 rounded-2xl rounded-bl-none border border-amber-500/30 flex items-center gap-3">
-              <div className="w-4 h-4 border-2 border-amber-400 border-t-transparent rounded-full animate-spin" />
-              <span className="text-sm text-amber-300 font-sans">الباحث يستقرئ المعاجم ويستنبط الإعراب...</span>
+            <div className="bg-slate-900/90 px-3 py-1.5 rounded-xl border border-amber-500/30 flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full bg-amber-400 animate-ping" />
+              <span className="text-xs text-amber-300 font-sans">جاري استكمال التدفق...</span>
             </div>
           </div>
         )}

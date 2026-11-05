@@ -1,14 +1,180 @@
 import express from 'express';
-import type { Request, Response } from 'express';
+import type { Request, Response, NextFunction } from 'express';
 import path from 'path';
+import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 import { GoogleGenAI, Modality } from '@google/genai';
+import {
+  initializeAndVerifyModels,
+  getCandidateModels,
+  withAttemptTimeout,
+  recordModel404,
+} from './models.config';
+import { splitIntoSentenceChunks, areBaseLettersEqual } from './utils/textUtils';
+import { verifyQuranicVersesInText } from './quranVerification';
+
+export class ForbiddenError extends Error {
+  public rule: string;
+  public details: string;
+  constructor(rule: string, details: string) {
+    super(`FORBIDDEN: ${rule}`);
+    this.name = 'ForbiddenError';
+    this.rule = rule;
+    this.details = details;
+  }
+}
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
-// Generous payload limits for attached document files and audio/image payloads
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+// (3) Helmet security headers with CSP disabled in all environments to allow Vite & fonts/scripts
+app.use(
+  helmet({
+    contentSecurityPolicy: false, // CSP explicitly disabled to prevent blocking Vite or scripts
+    frameguard: false, // Required for AI Studio iframe preview environment
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
+  })
+);
+
+// Helper to determine if an incoming request is same-origin
+function isSameOrigin(origin: string, req: Request): boolean {
+  try {
+    const originUrl = new URL(origin);
+    const hostHeader = (req.headers['x-forwarded-host'] as string) || req.headers.host || '';
+    const hosts = hostHeader.split(',').map((h) => h.trim().toLowerCase());
+    const originHost = originUrl.host.toLowerCase();
+    const originHostname = originUrl.hostname.toLowerCase();
+
+    return hosts.some((h) => h === originHost || h.split(':')[0] === originHostname);
+  } catch {
+    return false;
+  }
+}
+
+// Allowed origins whitelist from environment variable
+const allowedOrigins = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean)
+  : [];
+
+// (1) Dynamic CORS delegate scoped ONLY to /api/* routes
+const apiCorsDelegate = (req: Request, callback: (err: Error | null, options?: cors.CorsOptions) => void) => {
+  const origin = req.headers.origin as string | undefined;
+  const host = (req.headers['x-forwarded-host'] as string) || req.headers.host || 'unknown';
+
+  // (3) In non-production, everything is allowed
+  if (process.env.NODE_ENV !== 'production') {
+    return callback(null, {
+      origin: true,
+      credentials: true,
+      methods: ['GET', 'POST', 'OPTIONS'],
+      allowedHeaders: ['Content-Type', 'Authorization'],
+    });
+  }
+
+  // (2) Requests with no Origin header are always allowed (same-origin, curl, server-to-server)
+  if (!origin) {
+    return callback(null, {
+      origin: true,
+      credentials: true,
+      methods: ['GET', 'POST', 'OPTIONS'],
+      allowedHeaders: ['Content-Type', 'Authorization'],
+    });
+  }
+
+  // (2) Same-origin requests are always allowed
+  if (isSameOrigin(origin, req)) {
+    return callback(null, {
+      origin: true,
+      credentials: true,
+      methods: ['GET', 'POST', 'OPTIONS'],
+      allowedHeaders: ['Content-Type', 'Authorization'],
+    });
+  }
+
+  // If explicit allowedOrigins are configured, check against them
+  if (allowedOrigins.length > 0) {
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, {
+        origin: true,
+        credentials: true,
+        methods: ['GET', 'POST', 'OPTIONS'],
+        allowedHeaders: ['Content-Type', 'Authorization'],
+      });
+    }
+
+    // (4) Rejection: Log details and supply specific rule
+    console.warn(`[server 403] CORS_ORIGIN_NOT_ALLOWED: origin '${origin}' rejected for host '${host}' on path '${req.originalUrl || req.path}'`);
+
+    const forbiddenErr = new ForbiddenError(
+      'CORS_ORIGIN_NOT_ALLOWED',
+      `Origin '${origin}' is not permitted by CORS policy.`
+    );
+    return callback(forbiddenErr, { origin: false });
+  }
+
+  // Default: allow
+  return callback(null, {
+    origin: true,
+    credentials: true,
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+  });
+};
+
+// (1) Apply CORS ONLY to /api/* routes, never to Vite middleware or static files
+app.use('/api', cors(apiCorsDelegate));
+
+// Rate limiters applied strictly to /api/gemini routes
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 20,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: {
+    error: 'تم تجاوز الحد المسموح من الطلبات اللغوية (20 طلباً في الدقيقة). يرجى الانتظار دقيقة والمحاولة ثانية.',
+    code: 'RATE_LIMIT_EXCEEDED',
+  },
+});
+
+const artLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 5,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: {
+    error: 'تم تجاوز الحد المسموح لتوليد اللوحات الفنية (5 طلبات في الدقيقة). يرجى التريث قليلاً والمحاولة مجدداً.',
+    code: 'RATE_LIMIT_ART_EXCEEDED',
+  },
+});
+
+const speechLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 10,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: {
+    error: 'تم تجاوز الحد المسموح لتوليد النطق الصوتي (10 طلبات في الدقيقة). يرجى التريث قليلاً والمحاولة مجدداً.',
+    code: 'RATE_LIMIT_SPEECH_EXCEEDED',
+  },
+});
+
+app.use('/api/gemini', apiLimiter);
+
+// Per-Route JSON Payload Limits
+const json15mb = express.json({ limit: '15mb' });
+const json100kb = express.json({ limit: '100kb' });
+
+// Allowed MIME types for uploaded files in Deep Search
+const ALLOWED_MIME_TYPES = new Set([
+  'application/pdf',
+  'image/png',
+  'image/jpeg',
+  'image/jpg',
+  'text/plain',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/msword',
+]);
 
 // Helper to get fresh GoogleGenAI instance with telemetry headers
 const getAI = () => {
@@ -23,27 +189,109 @@ const getAI = () => {
   });
 };
 
+// Safety check helper
+interface SafetyCheckResult {
+  blocked: boolean;
+  reason?: string;
+}
+
+function checkSafetyBlock(response: any): SafetyCheckResult {
+  if (response?.promptFeedback?.blockReason) {
+    return { blocked: true, reason: String(response.promptFeedback.blockReason) };
+  }
+
+  const candidate = response?.candidates?.[0];
+  if (candidate?.finishReason) {
+    const blockedReasons = ['SAFETY', 'BLOCKLIST', 'PROHIBITED_CONTENT', 'RECITATION'];
+    if (blockedReasons.includes(candidate.finishReason)) {
+      return { blocked: true, reason: candidate.finishReason };
+    }
+  }
+
+  return { blocked: false };
+}
+
 /**
  * 1. Deep Search & Arabic Linguistics Analysis
  */
-app.post('/api/gemini/deep-search', async (req: Request, res: Response): Promise<void> => {
+app.post('/api/gemini/deep-search', json15mb, async (req: Request, res: Response): Promise<void> => {
   try {
-    const { query, context = '', fileData } = req.body;
+    let { query, context = '', fileData } = req.body || {};
+
+    if (typeof query === 'string') {
+      query = query.trim();
+    } else {
+      query = '';
+    }
+
     if (!query && !fileData) {
-      res.status(400).json({ error: 'Query or fileData is required' });
+      res.status(400).json({
+        error: 'يرجى تقديم استفسار أو إرفاق ملف لبدء التحليل اللغوي.',
+        code: 'MISSING_QUERY_OR_FILE',
+      });
       return;
     }
 
+    if (query.length > 8000) {
+      res.status(400).json({
+        error: 'طول السؤال يتجاوز الحد الأقصى المسموح به (8000 حرف). يرجى تقليص السؤال.',
+        code: 'QUERY_TOO_LONG',
+      });
+      return;
+    }
+
+    if (typeof context === 'string') {
+      if (context.length > 20000) {
+        context = context.slice(-20000);
+      }
+    } else {
+      context = '';
+    }
+
+    if (fileData) {
+      if (
+        !fileData.mimeType ||
+        typeof fileData.mimeType !== 'string' ||
+        !ALLOWED_MIME_TYPES.has(fileData.mimeType.toLowerCase())
+      ) {
+        res.status(400).json({
+          error: 'نوع الملف غير مدعوم. الصيغ المدعومة هي: PDF، PNG، JPEG، TXT، DOCX فقط.',
+          code: 'INVALID_FILE_TYPE',
+        });
+        return;
+      }
+      if (!fileData.data || typeof fileData.data !== 'string') {
+        res.status(400).json({
+          error: 'بيانات الملف المرفق غير صالحة أو غير مقروءة.',
+          code: 'INVALID_FILE_DATA',
+        });
+        return;
+      }
+    }
+
+    // Set up Server-Sent Events (SSE)
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+
+    const sendEvent = (event: string, payload: any) => {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
+    };
+
     const ai = getAI();
     const systemInstruction = `
-      أنت "لسـان"، المحرك اللغوي الذكي المتقدم في خدمة لغة الضاد، المستند إلى أدق معايير التدقيق اللغوي والبيان الفصيح (بروتوكول نانوبنانا اللغوي 2.0).
-      مهمتك:
-      1. تقديم تحليلات إعرابية وصرفية وبلاغية مفصلة ودقيقة.
-      2. شرح الشواهد الشعرية، معاني مفردات المعاجم القديمة (لسان العرب، القاموس المحيط، تاج العروس).
-      3. التدقيق الصارم: التمييز القاطع بين همزات الوصل والقطع، التاء المربوطة والهاء، الياء والألف المقصورة.
-      4. عند تحليل ملف مرفق، لخصه بعناية واستخرج درره اللغوية، الأخطاء الشائعة، وقدم مقترحات صياغة رفيعة.
-      5. نسّق إجابتك بعناوين واضحة، ونقاط مرتبة، واستشهد بالشعر والقرآن الكريم إن اقتضى السياق. أسلوبك رصين ومحبب.
-    `;
+أنت "لسـان"، المحرك اللغوي الذكي المتقدم في خدمة لغة الضاد وعلوم اللسان العربي.
+مهمتك:
+1. تقديم تحليلات إعرابية وصرفية وبلاغية مفصلة ودقيقة مستندة لأصول علم النحو وفقه اللغة.
+2. شرح الشواهد الشعرية، ومعاني المفردات من أمهات المعاجم المعتمدة (لسان العرب، القاموس المحيط، تاج العروس، معجم الصحاح).
+3. الالتزام الصارم بالأمانة العلمية: يُمنع منعاً باتاً اختلاق أو فبركة الشواهد الشعرية، أو عزو الآيات القرآنية لغير مواضعها، أو تأليف نصوص معجمية غير موثقة. إذا لم تكن متأكداً تماماً من صحة شاهد أو نسبة قول أو جذر لفظ، صرّح بذلك بوضوح وبكل أمانة.
+4. التدقيق الصارم: التمييز القاطع بين همزات الوصل والقطع، التاء المربوطة والهاء، الياء والألف المقصورة.
+5. عند تحليل ملف مرفق، لخصه بعناية واستخرج درره اللغوية، الأخطاء الشائعة، وقدم مقترحات صياغة رفيعة.
+6. نسّق إجابتك بعناوين واضحة، ونقاط مرتبة، واستشهد بالشعر والقرآن الكريم عند الاقتضاء بصورة موثقة.
+7. في نهاية كل إجابة أو تحليل، اختم بسطر مستقل يحدد مستوى الثقة العلمية بصيغة واضحة:
+[مستوى الثقة: عالية] أو [مستوى الثقة: متوسطة - مع ذكر السبب] أو [مستوى الثقة: منخفضة - مع ذكر السبب].
+`;
 
     const parts: any[] = [{ text: context ? `السياق السابق:\n${context}\n\nالسؤال الحالي:\n${query}` : query }];
 
@@ -56,17 +304,12 @@ app.post('/api/gemini/deep-search', async (req: Request, res: Response): Promise
       });
     }
 
-    const candidateModels = [
-      'gemini-3.8-flash',
-      'gemini-3.1-pro-preview',
-      'gemini-3.1-flash-lite',
-      'gemini-flash-latest',
-    ];
+    const candidateModels = getCandidateModels('deepSearch', 3);
     let lastError: any = null;
 
     for (const modelId of candidateModels) {
       try {
-        const response = await ai.models.generateContent({
+        const streamPromise = ai.models.generateContentStream({
           model: modelId,
           contents: [{ role: 'user', parts }],
           config: {
@@ -74,83 +317,231 @@ app.post('/api/gemini/deep-search', async (req: Request, res: Response): Promise
           },
         });
 
-        res.json({ text: response.text || 'عذراً، لم أتمكن من استخراج إجابة دقيقة.' });
+        const stream = await withAttemptTimeout(streamPromise, 30000);
+
+        let fullAccumulatedText = '';
+        let isFirst = true;
+        let isBlocked = false;
+
+        for await (const chunk of stream) {
+          if (isFirst) {
+            const safety = checkSafetyBlock(chunk);
+            if (safety.blocked) {
+              isBlocked = true;
+              sendEvent('error', {
+                error: 'تعذر إتمام البحث لمخالفته معايير الأمان وسلامة المحتوى.',
+                code: 'CONTENT_SAFETY_BLOCKED',
+              });
+              break;
+            }
+            isFirst = false;
+          }
+
+          const token = chunk.text || '';
+          if (token) {
+            fullAccumulatedText += token;
+            sendEvent('token', { token });
+          }
+        }
+
+        if (isBlocked) {
+          res.end();
+          return;
+        }
+
+        if (!fullAccumulatedText) {
+          console.warn(`[server] Model ${modelId} returned no tokens, trying next model.`);
+          continue;
+        }
+
+        // Verify Quranic verses against api.alquran.cloud (Uthmani edition)
+        const verifiedFullText = await verifyQuranicVersesInText(fullAccumulatedText);
+
+        sendEvent('done', {
+          fullText: verifiedFullText,
+          verified: verifiedFullText !== fullAccumulatedText,
+        });
+
+        res.end();
         return;
       } catch (err: any) {
         lastError = err;
+        if (err?.status === 404 || err?.message?.includes('404') || err?.message?.toLowerCase().includes('not found')) {
+          recordModel404(modelId);
+        }
         console.warn(`[server] Model ${modelId} failed for deepSearch:`, err?.message || err);
       }
     }
 
-    res.status(500).json({ error: lastError?.message || 'Failed to generate deep search response' });
+    console.error('[server] All candidate models failed in deep-search:', lastError);
+    sendEvent('error', {
+      error: 'تعذر الحصول على استجابة من محرك البحث اللغوي حالياً. يرجى المحاولة لاحقاً.',
+      code: 'AI_SERVICE_UNAVAILABLE',
+    });
+    res.end();
   } catch (error: any) {
-    console.error('[server] Error in deep-search:', error);
-    res.status(500).json({ error: error?.message || 'Internal server error' });
+    console.error('[server] Error in deep-search endpoint:', error);
+    if (!res.headersSent) {
+      res.status(500).json({
+        error: 'حدث خطأ في الخادم أثناء معالجة استفسارك.',
+        code: 'INTERNAL_SERVER_ERROR',
+      });
+    } else {
+      res.write(`event: error\ndata: ${JSON.stringify({ error: 'حدث خطأ غير متوقع.', code: 'INTERNAL_SERVER_ERROR' })}\n\n`);
+      res.end();
+    }
   }
 });
 
 /**
  * 2. Tashkeel (Diacritization) & Proofreading
  */
-app.post('/api/gemini/tashkeel', async (req: Request, res: Response): Promise<void> => {
+app.post('/api/gemini/tashkeel', json100kb, async (req: Request, res: Response): Promise<void> => {
   try {
-    const { text, mode = 'full' } = req.body;
-    if (!text) {
-      res.status(400).json({ error: 'Text is required' });
+    let { text, mode = 'full' } = req.body || {};
+
+    if (typeof text !== 'string' || !text.trim()) {
+      res.status(400).json({
+        error: 'يرجى إدخال النص المطلوب تشكيله أو تدقيقه.',
+        code: 'MISSING_TEXT',
+      });
+      return;
+    }
+
+    text = text.trim();
+    if (text.length > 8000) {
+      res.status(400).json({
+        error: 'طول النص المطلوب تشكيله يتجاوز الحد الأقصى المسموح به (8000 حرف).',
+        code: 'TEXT_TOO_LONG',
+      });
       return;
     }
 
     const ai = getAI();
     let promptInstruction = '';
     if (mode === 'ending') {
-      promptInstruction = `اضبط أواخر الكلمات فقط في النص التالي ضبطاً إعرابياً دقيقاً، مع ترك الحروف الداخلية غير المشكلة إلا إذا كانت ضرورية لمنع اللبس. أعد النص فقط دون أي مقدمات أو شروحات.`;
+      promptInstruction = `اضبط أواخر الكلمات فقط في النص التالي ضبطاً إعرابياً دقيقاً، مع ترك الحروف الداخلية غير المشكلة إلا إذا كانت ضرورية لمنع اللبس. التزم بالقواعد النحوية السليمة وحافظ على الحروف الأصلية دون تغيير. أعد النص فقط دون أي مقدمات أو شروحات.`;
     } else if (mode === 'proofread') {
       promptInstruction = `قم بتدقيق النص العربي التالي لغوياً ونحوياً وصرفياً وإملائياً مع ضبط حركاته، ثم اذكر أسفله في قسم موجز "ملاحظات التدقيق" أهم الأخطاء التي تم تصويبها إن وُجدت.`;
     } else {
-      promptInstruction = `مهمتك هي تشكيل النص التالي تشكيلاً كاملاً ودقيقاً (بنية صرفية وإعراباً لأواخر الكلمات) بنسبة دقة 100% وفق بروتوكول نانوبنانا 2 اللغوي. التزم بالقواعد النحوية السليمة. أعد النص المشكول فقط دون أي زيادات أو شروحات.`;
+      promptInstruction = `مهمتك هي تشكيل النص التالي تشكيلاً كاملاً ودقيقاً (بنية صرفية وإعراباً لأواخر الكلمات) وفق القواعد النحوية والصرفية السليمة. التزم بالحروف الأصلية للنص بدقة تامة دون حذف أو تبديل أو زيادة. أعد النص المشكول فقط دون أي زيادات أو شروحات.`;
     }
 
-    const prompt = `${promptInstruction}\n\nالنص:\n${text}`;
-    const candidateModels = [
-      'gemini-3.8-flash',
-      'gemini-3.1-pro-preview',
-      'gemini-3.1-flash-lite',
-      'gemini-flash-latest',
-    ];
-    let lastError: any = null;
+    const chunks = splitIntoSentenceChunks(text, 1500);
+    const candidateModels = getCandidateModels('tashkeel', 3);
 
-    for (const modelId of candidateModels) {
-      try {
-        const response = await ai.models.generateContent({
-          model: modelId,
-          contents: prompt,
-        });
-
-        if (response.text) {
-          res.json({ text: response.text });
-          return;
-        }
-      } catch (err: any) {
-        lastError = err;
-        console.warn(`[server] Model ${modelId} failed for tashkeel:`, err?.message || err);
+    const generateChunkDiacritics = async (chunkText: string, retryNotice = false): Promise<string> => {
+      let chunkPrompt = `${promptInstruction}\n\nالنص:\n${chunkText}`;
+      if (retryNotice) {
+        chunkPrompt += `\n\nتنبيه مهم: يرجى المحافظة الدقيقة على الحروف والكلمات الأصلية كما هي دون حذف أو تعديل أو إضافة أي كلمة، واقتصر على وضع حركات التشكيل.`;
       }
+
+      let lastChunkErr: any = null;
+
+      for (const modelId of candidateModels) {
+        try {
+          const genPromise = ai.models.generateContent({
+            model: modelId,
+            contents: chunkPrompt,
+            config: {
+              temperature: 0.2,
+            },
+          });
+
+          const response = await withAttemptTimeout(genPromise, 30000);
+
+          const safety = checkSafetyBlock(response);
+          if (safety.blocked) {
+            throw new Error('CONTENT_SAFETY_BLOCKED');
+          }
+
+          if (response.text) {
+            return response.text.trim();
+          }
+        } catch (err: any) {
+          lastChunkErr = err;
+          if (err?.status === 404 || err?.message?.includes('404') || err?.message?.toLowerCase().includes('not found')) {
+            recordModel404(modelId);
+          }
+          console.warn(`[server] Model ${modelId} failed for tashkeel chunk:`, err?.message || err);
+        }
+      }
+
+      throw lastChunkErr || new Error('FAILED_ALL_MODELS');
+    };
+
+    const processedChunks: string[] = [];
+    let hasBaseMismatch = false;
+
+    for (const chunk of chunks) {
+      let outputChunk = await generateChunkDiacritics(chunk, false);
+
+      if (mode !== 'proofread') {
+        if (!areBaseLettersEqual(chunk, outputChunk)) {
+          console.warn('[server] Base letters mismatch detected in diacritized chunk. Retrying once...');
+          try {
+            const retried = await generateChunkDiacritics(chunk, true);
+            if (areBaseLettersEqual(chunk, retried)) {
+              outputChunk = retried;
+            } else {
+              hasBaseMismatch = true;
+              outputChunk = retried;
+            }
+          } catch (retryErr) {
+            hasBaseMismatch = true;
+          }
+        }
+      }
+
+      processedChunks.push(outputChunk);
     }
 
-    res.status(500).json({ error: lastError?.message || 'Failed to process tashkeel' });
+    const finalResultText = processedChunks.join('\n');
+
+    res.json({
+      text: finalResultText,
+      warning: hasBaseMismatch
+        ? 'تنبيه: قد يحتوي النص المشكول على اختلاف طفيف في بعض الحروف مقارنة بالأصل.'
+        : undefined,
+      baseMismatch: hasBaseMismatch,
+    });
   } catch (error: any) {
     console.error('[server] Error in tashkeel:', error);
-    res.status(500).json({ error: error?.message || 'Internal server error' });
+    if (error?.message === 'CONTENT_SAFETY_BLOCKED') {
+      res.status(422).json({
+        error: 'تعذر تشكيل النص لمخالفته معايير الأمان وسلامة المحتوى.',
+        code: 'CONTENT_SAFETY_BLOCKED',
+      });
+      return;
+    }
+    res.status(500).json({
+      error: 'حدث خطأ في الخادم أثناء معالجة تشكيل النص.',
+      code: 'INTERNAL_SERVER_ERROR',
+    });
   }
 });
 
 /**
  * 3. Arabic Calligraphy & Islamic Art Generation
  */
-app.post('/api/gemini/art', async (req: Request, res: Response): Promise<void> => {
+app.post('/api/gemini/art', artLimiter, json100kb, async (req: Request, res: Response): Promise<void> => {
   try {
-    const { prompt, style = 'calligraphy', scriptType = 'خط الثلث', atmosphere = 'royal-gold' } = req.body;
-    if (!prompt) {
-      res.status(400).json({ error: 'Prompt is required' });
+    let { prompt, style = 'calligraphy', scriptType = 'خط الثلث', atmosphere = 'royal-gold' } = req.body || {};
+
+    if (typeof prompt !== 'string' || !prompt.trim()) {
+      res.status(400).json({
+        error: 'يرجى إدخال وصف اللوحة أو النص المراد تخطيطه.',
+        code: 'MISSING_PROMPT',
+      });
+      return;
+    }
+
+    prompt = prompt.trim();
+    if (prompt.length > 300) {
+      res.status(400).json({
+        error: 'طول وصف اللوحة يتجاوز الحد الأقصى المسموح به (300 حرف).',
+        code: 'PROMPT_TOO_LONG',
+      });
       return;
     }
 
@@ -175,23 +566,32 @@ app.post('/api/gemini/art', async (req: Request, res: Response): Promise<void> =
 
     const enhancedPrompt = `${styleDesc} ${atmosphereDesc} The central Arabic text clearly depicted is: "${prompt}". Museum-grade, ultra-detailed composition, pristine typography with no scrambled characters.`;
 
-    const candidateImageModels = [
-      'gemini-3.1-flash-lite-image',
-      'gemini-nano-banana-2.1',
-      'gemini-3-pro-image',
-    ];
+    const candidateImageModels = getCandidateModels('art', 3);
     let lastError: any = null;
 
     for (const modelId of candidateImageModels) {
       try {
-        const response = await ai.models.generateContent({
+        const artPromise = ai.models.generateContent({
           model: modelId,
           contents: { parts: [{ text: enhancedPrompt }] },
         });
 
+        const response = await withAttemptTimeout(artPromise, 30000);
+
+        const safety = checkSafetyBlock(response);
+        if (safety.blocked) {
+          console.warn(`[server] Art generation blocked by safety:`, safety.reason);
+          res.status(422).json({
+            error: 'تعذر توليد اللوحة الفنية لمخالفتها معايير الأمان وسلامة المحتوى.',
+            code: 'CONTENT_SAFETY_BLOCKED',
+          });
+          return;
+        }
+
         for (const candidate of response.candidates || []) {
-          for (const part of candidate.content.parts) {
-            if (part.inlineData && part.inlineData.mimeType.startsWith('image')) {
+          const parts = candidate.content?.parts ?? [];
+          for (const part of parts) {
+            if (part.inlineData && part.inlineData.mimeType?.startsWith('image')) {
               res.json({ image: `data:${part.inlineData.mimeType};base64,${part.inlineData.data}` });
               return;
             }
@@ -199,137 +599,188 @@ app.post('/api/gemini/art', async (req: Request, res: Response): Promise<void> =
         }
       } catch (err: any) {
         lastError = err;
+        if (err?.status === 404 || err?.message?.includes('404') || err?.message?.toLowerCase().includes('not found')) {
+          recordModel404(modelId);
+        }
         console.warn(`[server] Image model ${modelId} failed:`, err?.message || err);
       }
     }
 
-    res.status(500).json({ error: lastError?.message || 'No image data returned from model' });
+    console.error('[server] All art models failed:', lastError);
+    res.status(502).json({
+      error: 'تعذر توليد اللوحة الفنية حالياً. يرجى إعادة المحاولة بنص أو أسلوب مختلف.',
+      code: 'IMAGE_GENERATION_FAILED',
+    });
   } catch (error: any) {
     console.error('[server] Error in art generation:', error);
-    res.status(500).json({ error: error?.message || 'Internal server error' });
+    res.status(500).json({
+      error: 'حدث خطأ في الخادم أثناء توليد اللوحة الفنية.',
+      code: 'INTERNAL_SERVER_ERROR',
+    });
   }
 });
 
 /**
  * 4. Text to Speech (TTS)
  */
-app.post('/api/gemini/speech', async (req: Request, res: Response): Promise<void> => {
+app.post('/api/gemini/speech', speechLimiter, json100kb, async (req: Request, res: Response): Promise<void> => {
   try {
-    const { text, voiceName = 'Zephyr', styleInstruction, enforcedGender } = req.body;
-    if (!text) {
-      res.status(400).json({ error: 'Text is required' });
+    let { text, voiceName = 'Zephyr', styleInstruction, enforcedGender } = req.body || {};
+
+    if (typeof text !== 'string' || !text.trim()) {
+      res.status(400).json({
+        error: 'يرجى إدخال النص المطلوب تحويله إلى نطق صوتي.',
+        code: 'MISSING_TEXT',
+      });
+      return;
+    }
+
+    text = text.trim();
+    if (text.length > 8000) {
+      res.status(400).json({
+        error: 'طول النص الصوتي يتجاوز الحد الأقصى المسموح به (8000 حرف).',
+        code: 'TEXT_TOO_LONG',
+      });
       return;
     }
 
     const ai = getAI();
-    const MALE_VOICES = ['Fenrir', 'Charon', 'Puck'];
-    const FEMALE_VOICES = ['Kore', 'Zephyr'];
+    const DISTINCT_MALE_VOICES = ['Fenrir', 'Charon', 'Puck'];
+    const DISTINCT_FEMALE_VOICES = ['Zephyr', 'Kore'];
 
-    const VOICE_MAP: Record<string, { voice: string; gender: 'male' | 'female' }> = {
-      // 7 Male Voices
-      Fenrir: { voice: 'Fenrir', gender: 'male' },
-      Puck: { voice: 'Puck', gender: 'male' },
-      Charon: { voice: 'Charon', gender: 'male' },
-      Orus: { voice: 'Charon', gender: 'male' },
-      Umbriel: { voice: 'Fenrir', gender: 'male' },
-      Enceladus: { voice: 'Puck', gender: 'male' },
-      Achird: { voice: 'Charon', gender: 'male' },
-
-      // 8 Female Voices
-      Zephyr: { voice: 'Zephyr', gender: 'female' },
-      Kore: { voice: 'Kore', gender: 'female' },
-      Aoede: { voice: 'Kore', gender: 'female' },
-      Autonoe: { voice: 'Zephyr', gender: 'female' },
-      Erinome: { voice: 'Kore', gender: 'female' },
-      Callirrhoe: { voice: 'Zephyr', gender: 'female' },
-      Schedar: { voice: 'Kore', gender: 'female' },
-      Laomedeia: { voice: 'Zephyr', gender: 'female' },
-    };
-
-    const entry = VOICE_MAP[voiceName];
-    const targetGender: 'male' | 'female' = enforcedGender || (entry ? entry.gender : 'female');
+    let targetGender: 'male' | 'female' = enforcedGender || 'female';
+    if (!enforcedGender) {
+      if (DISTINCT_MALE_VOICES.includes(voiceName)) {
+        targetGender = 'male';
+      } else {
+        targetGender = 'female';
+      }
+    }
 
     let effectiveVoice: string;
     if (targetGender === 'male') {
-      if (entry && entry.gender === 'male' && MALE_VOICES.includes(entry.voice)) {
-        effectiveVoice = entry.voice;
-      } else if (MALE_VOICES.includes(voiceName)) {
-        effectiveVoice = voiceName;
-      } else {
-        effectiveVoice = 'Charon';
-      }
+      effectiveVoice = DISTINCT_MALE_VOICES.includes(voiceName) ? voiceName : 'Fenrir';
     } else {
-      if (entry && entry.gender === 'female' && FEMALE_VOICES.includes(entry.voice)) {
-        effectiveVoice = entry.voice;
-      } else if (FEMALE_VOICES.includes(voiceName)) {
-        effectiveVoice = voiceName;
-      } else {
-        effectiveVoice = 'Zephyr';
-      }
+      effectiveVoice = DISTINCT_FEMALE_VOICES.includes(voiceName) ? voiceName : 'Zephyr';
     }
 
-    const genderInstruction = targetGender === 'male'
-      ? 'Read clearly in an authentic masculine Arabic male reciter voice (صوت قارئ رجل فصيح).'
-      : 'Read clearly in an authentic feminine Arabic female reciter voice (صوت قارئة أنثى فصيحة).';
-
-    const combinedStyle = styleInstruction && styleInstruction.trim() !== ''
-      ? `${genderInstruction} Style: ${styleInstruction}`
-      : genderInstruction;
-
-    const speechContent = `Say in Arabic (${combinedStyle}): ${text}`;
-
-    const candidateModels = [
-      'gemini-3.8-flash-lite-tts',
-      'gemini-3.8-flash-tts',
-    ];
-
-    const attempts = [
-      speechContent,
-      `${targetGender === 'male' ? 'صوت رجل: ' : 'صوت امرأة: '}${text}`,
-      text,
-    ];
-
+    const candidateModels = getCandidateModels('speech', 3);
     let lastError: any = null;
 
+    const speechContents = [
+      {
+        role: 'user',
+        parts: [
+          {
+            text,
+            speechMetadata: styleInstruction && typeof styleInstruction === 'string' && styleInstruction.trim()
+              ? { style: styleInstruction.trim() }
+              : undefined,
+          },
+        ],
+      },
+    ];
+
     for (const modelId of candidateModels) {
-      for (const contentPrompt of attempts) {
-        try {
-          const response = await ai.models.generateContent({
-            model: modelId,
-            contents: [{ parts: [{ text: contentPrompt }] }],
-            config: {
-              responseModalities: [Modality.AUDIO],
-              speechConfig: {
-                voiceConfig: {
-                  prebuiltVoiceConfig: { voiceName: effectiveVoice },
-                },
+      try {
+        const ttsPromise = ai.models.generateContent({
+          model: modelId,
+          contents: speechContents,
+          config: {
+            responseModalities: [Modality.AUDIO],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: effectiveVoice },
               },
             },
+          },
+        });
+
+        const response = await withAttemptTimeout(ttsPromise, 30000);
+
+        const safety = checkSafetyBlock(response);
+        if (safety.blocked) {
+          console.warn(`[server] Speech generation blocked by safety:`, safety.reason);
+          res.status(422).json({
+            error: 'تعذر توليد النطق الصوتي لمخالفته معايير الأمان وسلامة المحتوى.',
+            code: 'CONTENT_SAFETY_BLOCKED',
           });
-
-          const audioPart = response.candidates?.[0]?.content?.parts?.[0]?.inlineData;
-          const base64Audio = audioPart?.data;
-          const mimeType = audioPart?.mimeType || 'audio/pcm;rate=24000';
-
-          if (base64Audio) {
-            res.json({ base64Audio, mimeType });
-            return;
-          }
-        } catch (err: any) {
-          lastError = err;
-          console.warn(`[server] TTS attempt with ${modelId} failed:`, err?.message || err);
-          if (err?.status === 404 || err?.message?.includes('not found')) {
-            break;
-          }
+          return;
         }
+
+        const candidate = response.candidates?.[0];
+        const parts = candidate?.content?.parts ?? [];
+        const audioPart = parts[0]?.inlineData;
+        const base64Audio = audioPart?.data;
+        const mimeType = audioPart?.mimeType || 'audio/wav';
+
+        if (base64Audio) {
+          res.json({ base64Audio, mimeType });
+          return;
+        }
+      } catch (err: any) {
+        lastError = err;
+        if (err?.status === 404 || err?.message?.includes('404') || err?.message?.toLowerCase().includes('not found')) {
+          recordModel404(modelId);
+        }
+        console.warn(`[server] TTS model ${modelId} failed:`, err?.message || err);
       }
     }
 
-    res.status(500).json({ error: lastError?.message || 'Failed to generate speech audio' });
+    console.error('[server] All models failed in speech generation:', lastError);
+    res.status(502).json({
+      error: 'تعذر توليد الصوت في الوقت الحالي. يرجى إعادة المحاولة لاحقاً.',
+      code: 'SPEECH_GENERATION_FAILED',
+    });
   } catch (error: any) {
     console.error('[server] Error in speech generation:', error);
-    res.status(500).json({ error: error?.message || 'Internal server error' });
+    res.status(500).json({
+      error: 'حدث خطأ في الخادم أثناء توليد الصوت.',
+      code: 'INTERNAL_SERVER_ERROR',
+    });
   }
+});
+
+// (4) Centralized API Error Handler: Logs origin/host and returns JSON body specifying the exact rule on 403
+app.use('/api', (err: any, req: Request, res: Response, _next: NextFunction) => {
+  const host = (req.headers['x-forwarded-host'] as string) || req.headers.host || 'unknown';
+  const origin = (req.headers.origin as string) || 'none';
+
+  if (
+    err instanceof ForbiddenError ||
+    err?.status === 403 ||
+    err?.message === 'CORS_NOT_ALLOWED' ||
+    err?.message?.startsWith('FORBIDDEN:')
+  ) {
+    const rule = err.rule || 'CORS_ORIGIN_CHECK';
+    const details = err.details || err.message || 'Request was rejected by security policy.';
+
+    console.warn(`[server 403] Security rule '${rule}' rejected request to '${req.originalUrl || req.path}' from origin: '${origin}', host: '${host}'`);
+
+    res.status(403).json({
+      error: 'غير مصرح بالوصول إلى هذا المسار وفقاً لسياسة الأمان.',
+      code: 'FORBIDDEN',
+      rule,
+      details,
+      origin,
+      host,
+    });
+    return;
+  }
+
+  if (err?.type === 'entity.too.large' || err?.status === 413) {
+    res.status(413).json({
+      error: 'حجم البيانات المرسلة يتجاوز الحد المسموح به لهذا المسار.',
+      code: 'PAYLOAD_TOO_LARGE',
+    });
+    return;
+  }
+
+  console.error('[server] API error:', err);
+  res.status(500).json({
+    error: 'حدث خطأ غير متوقع في خادم التطبيق.',
+    code: 'INTERNAL_SERVER_ERROR',
+  });
 });
 
 async function startServer() {
@@ -338,6 +789,15 @@ async function startServer() {
     res.status(200).send('OK');
   });
 
+  // Call the models list API at startup and log available models
+  try {
+    const ai = getAI();
+    await initializeAndVerifyModels(ai);
+  } catch (initErr) {
+    console.warn('[server] Model verification skipped during startup:', initErr);
+  }
+
+  // Mount Vite dev server or static file serving (NEVER subjected to API CORS/rate limits)
   if (process.env.NODE_ENV !== 'production') {
     try {
       const { createServer } = await import('vite');

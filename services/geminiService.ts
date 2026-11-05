@@ -1,11 +1,22 @@
 import { TashkeelMode } from '../types';
 
+export interface TashkeelResult {
+  text: string;
+  warning?: string;
+  baseMismatch?: boolean;
+}
+
 export const GeminiService = {
   /**
-   * General Deep Search & Linguistics Analysis
+   * General Deep Search & Linguistics Analysis with Server-Sent Events (SSE) Streaming
    * Calls server-side /api/gemini/deep-search
    */
-  async deepSearch(query: string, context: string = '', fileData?: { mimeType: string; data: string }): Promise<string> {
+  async deepSearch(
+    query: string,
+    context: string = '',
+    fileData?: { mimeType: string; data: string },
+    onChunk?: (streamedText: string, token: string) => void
+  ): Promise<string> {
     const response = await fetch('/api/gemini/deep-search', {
       method: 'POST',
       headers: {
@@ -19,15 +30,63 @@ export const GeminiService = {
       throw new Error(errData.error || `Server returned error status ${response.status}`);
     }
 
-    const data = await response.json();
-    return data.text || 'عذراً، لم أتمكن من استخراج إجابة دقيقة.';
+    if (!response.body) {
+      throw new Error('لم يتم استلام تدفق بيانات من الخادم.');
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let accumulatedText = '';
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const blocks = buffer.split('\n\n');
+      buffer = blocks.pop() || '';
+
+      for (const block of blocks) {
+        if (!block.trim()) continue;
+
+        const eventMatch = block.match(/^event:\s*(\w+)/m);
+        const dataMatch = block.match(/^data:\s*(.+)$/m);
+        const eventType = eventMatch ? eventMatch[1] : 'token';
+
+        if (dataMatch) {
+          try {
+            const data = JSON.parse(dataMatch[1]);
+            if (eventType === 'error' || data.error) {
+              throw new Error(data.error || 'حدث خطأ أثناء استقبال الإجابة.');
+            }
+
+            if (eventType === 'token' && data.token) {
+              accumulatedText += data.token;
+              onChunk?.(accumulatedText, data.token);
+            } else if (eventType === 'done') {
+              if (data.fullText) {
+                accumulatedText = data.fullText;
+                onChunk?.(accumulatedText, '');
+              }
+            }
+          } catch (err: any) {
+            if (err?.message && !err.message.includes('JSON')) {
+              throw err;
+            }
+          }
+        }
+      }
+    }
+
+    return accumulatedText || 'عذراً، لم أتمكن من استخراج إجابة دقيقة.';
   },
 
   /**
    * Precise Tashkeel & Linguistic Proofreading
    * Calls server-side /api/gemini/tashkeel
    */
-  async addDiacritics(text: string, mode: TashkeelMode = 'full'): Promise<string> {
+  async addDiacritics(text: string, mode: TashkeelMode = 'full'): Promise<TashkeelResult> {
     const response = await fetch('/api/gemini/tashkeel', {
       method: 'POST',
       headers: {
@@ -42,7 +101,11 @@ export const GeminiService = {
     }
 
     const data = await response.json();
-    return data.text || '';
+    return {
+      text: data.text || '',
+      warning: data.warning,
+      baseMismatch: data.baseMismatch,
+    };
   },
 
   /**
@@ -76,7 +139,7 @@ export const GeminiService = {
   },
 
   /**
-   * Text to Speech (Correct Arabic Pronunciation)
+   * Text to Speech (Distinct Arabic Voices)
    * Calls server-side /api/gemini/speech
    */
   async generateSpeech(
@@ -112,7 +175,7 @@ export const GeminiService = {
 
     return {
       buffer: bytes.buffer,
-      mimeType: data.mimeType || 'audio/pcm;rate=24000',
+      mimeType: data.mimeType || 'audio/wav',
     };
   },
 };

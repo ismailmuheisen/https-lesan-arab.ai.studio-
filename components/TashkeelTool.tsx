@@ -21,14 +21,19 @@ const TashkeelTool: React.FC<TashkeelToolProps> = ({ onSendToVoiceStudio }) => {
   const [loading, setLoading] = useState(false);
   const [copying, setCopying] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [warning, setWarning] = useState<string | null>(null);
 
   const handleTashkeel = async () => {
     if (!inputText.trim()) return;
     setLoading(true);
     setError(null);
+    setWarning(null);
     try {
       const result = await GeminiService.addDiacritics(inputText, mode);
-      setOutputText(result);
+      setOutputText(result.text);
+      if (result.warning) {
+        setWarning(result.warning);
+      }
     } catch (err) {
       setError("حدث خطأ أثناء معالجة وتشكيل النص. يرجى التأكد من الاتصال والمحاولة مجدداً.");
     } finally {
@@ -47,6 +52,7 @@ const TashkeelTool: React.FC<TashkeelToolProps> = ({ onSendToVoiceStudio }) => {
     setInputText('');
     setOutputText('');
     setError(null);
+    setWarning(null);
   };
 
   const handleSendToTTS = () => {
@@ -241,12 +247,20 @@ const TashkeelTool: React.FC<TashkeelToolProps> = ({ onSendToVoiceStudio }) => {
                 )}
 
                 {!loading && !error && (
-                  <textarea 
-                    readOnly
-                    className="w-full h-full bg-transparent border-none outline-none text-xl md:text-2xl leading-loose font-sans text-emerald-100 placeholder:text-slate-700 resize-none"
-                    value={outputText}
-                    placeholder="ستظهر النتيجة المشكولة والمضبوطة هنا بدقة تامة..."
-                  />
+                  <div className="flex flex-col h-full">
+                    <textarea 
+                      readOnly
+                      className="w-full flex-1 bg-transparent border-none outline-none text-xl md:text-2xl leading-loose font-sans text-emerald-100 placeholder:text-slate-700 resize-none"
+                      value={outputText}
+                      placeholder="ستظهر النتيجة المشكولة والمضبوطة هنا..."
+                    />
+                    {warning && (
+                      <div className="flex items-center gap-2 p-3 bg-amber-500/10 border border-amber-500/30 rounded-xl text-amber-300 text-xs mt-2 animate-in fade-in">
+                        <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" />
+                        <span>{warning}</span>
+                      </div>
+                    )}
+                  </div>
                 )}
              </div>
           </div>

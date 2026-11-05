@@ -25,23 +25,13 @@ interface VoiceLibrary {
 
 const ALL_VOICES: VoiceLibrary = {
   male: [
-    { id: 'Fenrir', label: 'طارق', gender: 'male', description: 'رخيم، جاد، مناسب للمقالات الفكرية' },
-    { id: 'Puck', label: 'باسل', gender: 'male', description: 'واضح، نبرة شبابية فصيحة' },
-    { id: 'Charon', label: 'عمرو', gender: 'male', description: 'عميق، وقور، نبرة وثائقية' },
-    { id: 'Orus', label: 'أوس', gender: 'male', description: 'جهوري، فخم، نبرة خطابة' },
-    { id: 'Umbriel', label: 'تميم', gender: 'male', description: 'هادئ، أدبي، نبرة تأملية' },
-    { id: 'Enceladus', label: 'ليث', gender: 'male', description: 'حماسي، قوي، للأشعار والقصائد' },
-    { id: 'Achird', label: 'حازم', gender: 'male', description: 'رصين، إخباري، لتقارير الأنباء' },
+    { id: 'Fenrir', label: 'طارق', gender: 'male', description: 'رخيم، جاد، مناسب للمقالات الفكرية والخطب' },
+    { id: 'Charon', label: 'عمرو', gender: 'male', description: 'عميق، وقور، نبرة وثائقية وتراثية' },
+    { id: 'Puck', label: 'باسل', gender: 'male', description: 'واضح، نبرة شبابية فصيحة ومعبرة' },
   ],
   female: [
     { id: 'Zephyr', label: 'نور', gender: 'female', description: 'متزن، دافئ، قراءة عامة فصيحة' },
-    { id: 'Kore', label: 'سلمى', gender: 'female', description: 'نقي، مخارج واضحة ومتقنة' },
-    { id: 'Aoede', label: 'ريم', gender: 'female', description: 'شجي، ناعم، للأدب والشعر' },
-    { id: 'Autonoe', label: 'بلقيس', gender: 'female', description: 'أدبي، بليغ، نبرة تراثية' },
-    { id: 'Erinome', label: 'أسماء', gender: 'female', description: 'وقور، ثابت، قراءة تعليمية' },
-    { id: 'Callirrhoe', label: 'فاطمة', gender: 'female', description: 'دافئ، هادئ، للسرد والحكايات' },
-    { id: 'Schedar', label: 'أروى', gender: 'female', description: 'متمكن، إذاعي، تقديم برامج' },
-    { id: 'Laomedeia', label: 'سارة', gender: 'female', description: 'حيوي، مشرق، نصوص حديثة' },
+    { id: 'Kore', label: 'سلمى', gender: 'female', description: 'نقي، مخارج واضحة ومتقنة للأدب والشعر' },
   ],
   cloned: []
 };
@@ -648,7 +638,7 @@ const VoiceStudio: React.FC = () => {
             استوديو الصوتيات والناطق العربي
           </h2>
           <p className="text-slate-400 font-light font-sans text-sm md:text-base">
-            توليد النطق العربي الفصيح بدقة الحركات بـ 15 صوتاً، ومختبر استنساخ وتنقية النبرات.
+            توليد النطق العربي الفصيح بدقة الحركات بأصوات مميزة ومتنوعة، ومختبر استنساخ وتنقية النبرات.
           </p>
         </div>
         
@@ -737,7 +727,7 @@ const VoiceStudio: React.FC = () => {
               </label>
               <div className="flex items-center gap-1.5 text-xs text-emerald-400 bg-emerald-500/10 px-3 py-1 rounded-full border border-emerald-500/20">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                <span>إلزام النبرة (ذكر / أنثى) مفعل سحابياً بدقة 100%</span>
+                <span>إلزام النبرة (ذكر / أنثى) مفعل سحابياً بدقة</span>
               </div>
             </div>
 
@@ -751,7 +741,7 @@ const VoiceStudio: React.FC = () => {
                     : 'bg-slate-900/60 border-slate-700/60 text-slate-400 hover:bg-white/5 hover:text-slate-200'
                 }`}
               >
-                <span>كلا المجموعتين (15 صوتاً)</span>
+                <span>كلا المجموعتين (5 أصوات)</span>
               </button>
 
               <button
@@ -769,7 +759,7 @@ const VoiceStudio: React.FC = () => {
                 }`}
               >
                 <span>👨 المجموعة الذكورية</span>
-                <span className="text-[11px] opacity-80">(7 أصوات)</span>
+                <span className="text-[11px] opacity-80">(3 أصوات)</span>
               </button>
 
               <button
@@ -787,7 +777,7 @@ const VoiceStudio: React.FC = () => {
                 }`}
               >
                 <span>👩 المجموعة الأنثوية</span>
-                <span className="text-[11px] opacity-80">(8 أصوات)</span>
+                <span className="text-[11px] opacity-80">(صوتان)</span>
               </button>
 
               {voices.cloned.length > 0 && (
@@ -838,7 +828,7 @@ const VoiceStudio: React.FC = () => {
                 <h3 className="text-emerald-400 font-bold mb-3 text-sm flex items-center justify-between">
                   <span className="flex items-center gap-2">
                     <span className="text-base">👨</span>
-                    <span>الأصوات الذكورية (7 نبرات فصيحة)</span>
+                    <span>الأصوات الذكورية (3 نبرات فصيحة)</span>
                   </span>
                   <span className="text-xs text-emerald-500/80 font-normal bg-emerald-500/10 px-2 py-0.5 rounded-full">
                     مخارج رخيمة وجهورية
@@ -889,7 +879,7 @@ const VoiceStudio: React.FC = () => {
               </div>
             )}
 
-            {/* Female Voices (8) */}
+            {/* Female Voices (2) */}
             {(voiceFilter === 'all' || voiceFilter === 'female') && (
               <div className={`p-4 rounded-2xl border transition-all ${
                 voiceFilter === 'female' ? 'lg:col-span-2 bg-purple-950/15 border-purple-500/30' : 'bg-slate-900/40 border-white/5'
@@ -897,7 +887,7 @@ const VoiceStudio: React.FC = () => {
                 <h3 className="text-purple-300 font-bold mb-3 text-sm flex items-center justify-between">
                   <span className="flex items-center gap-2">
                     <span className="text-base">👩</span>
-                    <span>الأصوات الأنثوية (8 نبرات فصيحة)</span>
+                    <span>الأصوات الأنثوية (نبرتان فصيحتان)</span>
                   </span>
                   <span className="text-xs text-purple-400/80 font-normal bg-purple-500/10 px-2 py-0.5 rounded-full">
                     نقاء وتناغم أدبي

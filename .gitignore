@@ -22,3 +22,14 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.cert
+*.crt
+credentials.json
+service-account*.json
